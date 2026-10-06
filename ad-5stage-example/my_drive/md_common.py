@@ -1,0 +1,186 @@
+"""my_drive 公共配置与 SE2 几何工具（全流程共享）。
+
+坐标系约定（与 NAVSIM/nuPlan 一致）：
+  * ego 系：x 前、y 左、z 上，原点 = 后轴中心地面，lidar2ego = identity；
+  * 相机外参：sensor2lidar（cam→ego）来自场景 pickle，使用时取逆得 ego→cam；
+  * BEV 栅格：行 = 前向 x、列 = 横向 y（本项目全链路统一这一约定）。
+"""
+from __future__ import annotations
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple
+import numpy as np
+
+# --------------------------------------------------------------------------- #
+# 路径（可用环境变量覆盖；数据集只读，输出默认写包内 workspace/）
+# --------------------------------------------------------------------------- #
+PKG_ROOT = Path(__file__).resolve().parent
+DEFAULT_WEIGHTS = PKG_ROOT / "weights" / "vit_small_patch16_dinov3.lvd1689m" / "model.safetensors"
+DATASET_ROOT = Path(os.environ.get(
+    "MD_DATASET_ROOT", "/media/qwc/66D8D21CD8D1EA77/navsim_workspace/dataset"))
+NAVSIM_LOGS = DATASET_ROOT / "navsim_logs" / "trainval"
+SENSOR_BLOBS = DATASET_ROOT / "sensor_blobs" / "trainval"
+MAPS_ROOT = Path(os.environ.get(
+    "NUPLAN_MAPS_ROOT", str(DATASET_ROOT / "maps")))
+WORK_ROOT = Path(os.environ.get("MD_WORK_ROOT", str(PKG_ROOT / "workspace")))
+
+# --------------------------------------------------------------------------- #
+# 时序规格：历史窗口 t-3..t 共 4 帧，未来轨迹 8 步（4s），间隔均 0.5s
+# --------------------------------------------------------------------------- #
+NUM_HISTORY = 4
+HISTORY_INTERVAL = 0.5
+NUM_FUTURE_POSES = 8
+FUTURE_INTERVAL = 0.5
+# 当前帧用 4 路相机；历史帧只保留前视（省 3/4 编码算力）
+CAMS_CURRENT = ("CAM_F0", "CAM_B0", "CAM_L0", "CAM_R0")
+CAM_HISTORY = "CAM_F0"
+
+
+# --------------------------------------------------------------------------- #
+# 全局配置
+# --------------------------------------------------------------------------- #
+@dataclass
+class Config:
+    # ---- 数据 ----
+    image_size: Tuple[int, int] = (640, 384)          # (W, H)，16 整除（40×24 patches）
+    seed: int = 0
+    # ---- BEV 几何（ego 系范围，米） ----
+    bev_grid: int = 50                                # BEV query 网格 50×50（1m/px）
+    pc_x_min: float = -10.0
+    pc_x_max: float = 40.0
+    pc_y_min: float = -25.0
+    pc_y_max: float = 25.0
+    bev_ref_heights: Tuple[float, ...] = (0.0, 0.6, 1.2, 1.8)  # 每 cell 4 个固定高度参考点
+    bev_sub_samples: int = 2                          # 每 cell 2×2 子点（缓解欠采样混叠）
+    bev_map_stride: int = 2                           # 地图分割 GT 分辨率倍数 → 100×100 @0.5m/px
+    det_stride: int = 2                               # 检测头输出分辨率倍数 → 100×100 @0.5m/px
+    map_query_radius: float = 60.0                    # 地图对象查询半径（米）
+    # ---- 模型 ----
+    d_model: int = 256
+    lora_rank: int = 32
+    num_scene_tokens: int = 16                        # 每相机 register/scene token 数
+    bev_layers: int = 3                               # BEV cross-attn 层数
+    bev_self_attn: bool = True                        # BEV cell 间自注意力
+    bev_heads: int = 8
+    planner_heads: int = 8
+    # ---- proposal planner ----
+    num_proposals: int = 64                           # 候选轨迹条数
+    decoder_layers: int = 4                           # 逐层精修层数
+    scorer_layers: int = 2                            # 质量 scorer 层数
+    # ---- 损失权重 ----
+    w_traj: float = 1.0
+    w_bev_map: float = 1.0
+    w_det_heatmap: float = 1.0
+    w_det_reg: float = 0.5
+    w_score_ce: float = 0.5                           # proposal 质量分数回归权重
+    map_bg_weight: float = 0.3                        # 地图 CE 背景类降权（背景占比高）
+    # ---- GRPO（stage 1.5） ----
+    grpo_temperature: float = 0.5                     # 策略 softmax 温度 τ
+    grpo_samples: int = 8                             # 每帧采样 proposal 数 k（组大小）
+    grpo_beta: float = 0.5                            # KL(π‖π_SFT) 权重
+    grpo_lr: float = 1e-4
+    w_r_lane: float = 1.0                             # 可行驶区合规权重
+    w_r_prog: float = 0.5                             # 前向进度权重（限幅 20m）
+    w_r_comf: float = 0.2                             # 舒适度（yaw 二阶差）
+    w_r_gt: float = 0.3                               # GT 锚定 exp(-ADE/2)
+    ego_len: float = 4.9                              # 自车 footprint（nuPlan Pacifica）
+    ego_wid: float = 2.3
+    col_margin: float = 0.3                           # 碰撞安全 margin（米）
+    # ---- 训练 ----
+    batch_size: int = 2
+    grad_accum: int = 4
+    lr: float = 2.5e-4
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+    epochs_stage1: int = 30
+    epochs_stage2: int = 30
+    epochs_stage3: int = 30
+    num_workers: int = 2
+    amp: bool = True
+
+    # ---- BEV 派生量 ----
+    @property
+    def bev_map_size(self) -> Tuple[int, int]:
+        """地图分割 GT 栅格 (H, W) = 前向 × 横向。"""
+        return (self.bev_grid * self.bev_map_stride,) * 2
+
+    @property
+    def det_map_size(self) -> Tuple[int, int]:
+        """检测 GT 栅格 (H, W)。"""
+        return (self.bev_grid * self.det_stride,) * 2
+
+    @property
+    def det_pixel_size(self) -> float:
+        return self.bev_pixel_size / self.det_stride
+
+    @property
+    def bev_pixel_size(self) -> float:
+        """BEV query 网格分辨率（米/像素）。"""
+        return (self.pc_x_max - self.pc_x_min) / self.bev_grid
+
+    def bev_cell_centers(self) -> np.ndarray:
+        """(bev_grid, bev_grid, 2) 的 cell 中心 (x, y) ego 坐标，第一维 = 前向 x。"""
+        ps = self.bev_pixel_size
+        xs = self.pc_x_min + (np.arange(self.bev_grid) + 0.5) * ps
+        ys = self.pc_y_min + (np.arange(self.bev_grid) + 0.5) * ps
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")     # [x 行, y 列]
+        return np.stack([gx, gy], axis=-1).astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# SE2 工具
+# --------------------------------------------------------------------------- #
+def normalize_angle(angle):
+    """角度归一化到 [-π, π)。"""
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+
+def absolute_to_relative_se2(origin: np.ndarray, poses: np.ndarray) -> np.ndarray:
+    """全局 SE2 位姿序列 (N,3) → origin 局部系 (N,3)，origin = (x, y, heading)。"""
+    origin = np.asarray(origin, dtype=np.float64)
+    poses = np.asarray(poses, dtype=np.float64)
+    c, s = np.cos(-origin[2]), np.sin(-origin[2])
+    rot = np.array([[c, -s], [s, c]])
+    xy = (poses[:, :2] - origin[:2]) @ rot.T
+    heading = normalize_angle(poses[:, 2] - origin[2])
+    return np.stack([xy[:, 0], xy[:, 1], heading], axis=-1)
+
+
+def quaternion_yaw(q) -> float:
+    """四元数 (w, x, y, z) → yaw（已用真实数据校验该顺序）。"""
+    w, x, y, z = [float(v) for v in q]
+    return math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+
+def rot3d_to_mat(rot) -> np.ndarray:
+    """(3,3) 旋转矩阵或四元数 (w,x,y,z) → (3,3) ndarray。"""
+    arr = np.asarray(rot, dtype=np.float64)
+    if arr.shape == (3, 3):
+        return arr
+    w, x, y, z = [float(v) for v in arr.flatten()]
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def cam_extrinsic_ego2cam(cam_entry: dict) -> np.ndarray:
+    """场景 pickle 的相机条目 → (4,4) ego→cam 变换（sensor2lidar 的逆，lidar≡ego）。"""
+    rt = np.eye(4, dtype=np.float64)
+    rt[:3, :3] = rot3d_to_mat(cam_entry["sensor2lidar_rotation"])
+    rt[:3, 3] = np.asarray(cam_entry["sensor2lidar_translation"], dtype=np.float64)
+    return np.linalg.inv(rt)
+
+
+def box_corners_bev(x: float, y: float, yaw: float, length: float, width: float) -> np.ndarray:
+    """自车系 2D 有向框 → (4,2) 角点（零依赖的 OrientedBox 替代）。"""
+    c, s = np.cos(yaw), np.sin(yaw)
+    hl, hw = length / 2.0, width / 2.0
+    local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+    rot = np.array([[c, -s], [s, c]])
+    return local @ rot.T + np.array([x, y])
