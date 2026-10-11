@@ -88,6 +88,16 @@ class Config:
     ego_len: float = 4.9                              # 自车 footprint（nuPlan Pacifica）
     ego_wid: float = 2.3
     col_margin: float = 0.3                           # 碰撞安全 margin（米）
+    # ---- foresight（stage 0，DINO-Foresight 化） ----
+    foresight_layers: int = 6                         # 预测器深度（时空可分离块数）
+    foresight_heads: int = 8                          # 预测器注意力头数
+    foresight_spatial: bool = True                    # False=纯时序注意力（回退旧行为，消融用）
+    foresight_target: str = "pca"                     # "pca"=多层concat+PCA；"last"=仅末层384维（旧行为）
+    foresight_pca_dim: int = 512                      # PCA 目标维度（输入侧 4 层×384=1536）
+    foresight_max_step: int = 4                       # 最大预测时距（×0.5s）；1=旧单步行为（消融用）
+    foresight_pca_windows: int = 2000                 # prepare-pca 采样窗口数
+    foresight_pca_patches: int = 128                  # 每窗口随机采样 patch 数
+
     # ---- 训练 ----
     batch_size: int = 2
     grad_accum: int = 4

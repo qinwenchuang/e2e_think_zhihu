@@ -277,20 +277,24 @@ def _grid_mask(img: np.ndarray, rng: np.random.RandomState,
 
 
 def find_pretext_windows(log_name: str, frames: Optional[List[dict]] = None) -> List[int]:
-    """pretext 无标签窗口：返回所有合法目标帧下标 j（窗口 = j-4..j，5 帧连续前视）。"""
+    """pretext 无标签窗口：返回所有合法「当前帧」下标 j（窗口 = j-3..j+4，8 帧连续前视）。
+
+    8 帧 = 4 帧历史（j-3..j，输入）+ 4 帧未来候选目标（j+1..j+4，对应 0.5/1.0/1.5/2.0s），
+    训练时随机采时距 k∈[1, foresight_max_step]（DINO-Foresight 式多步长监督）。
+    """
     if frames is None:
         frames = load_log_frames(log_name)
     n = len(frames)
-    if n < 5:
+    if n < 8:
         return []
     has_img = np.zeros(n, dtype=bool)
     for i, fr in enumerate(frames):
         has_img[i] = frame_has_image(log_name, fr, CAM_HISTORY)
     out = []
-    for j in range(4, n):
-        if not has_img[j - 4: j + 1].all():
+    for j in range(3, n - 4):
+        if not has_img[j - 3: j + 5].all():
             continue
-        ts = [frames[k]["timestamp"] for k in range(j - 4, j + 1)]
+        ts = [frames[k]["timestamp"] for k in range(j - 3, j + 5)]
         if not np.all(np.abs(np.diff(ts) / 1e6 - HISTORY_INTERVAL) < 0.25):
             continue
         out.append(j)
@@ -300,9 +304,10 @@ def find_pretext_windows(log_name: str, frames: Optional[List[dict]] = None) -> 
 def prepare_pretext_dataset(cfg: Config, num_windows: int, cache_root: Path,
                             val_fraction: float = 0.05, max_logs: int = 2000,
                             ) -> List[dict]:
-    """扫描日志 → 收集 5 帧窗口 → 复制唯一前视图像 → 写 index.json（日志级划分）。
+    """扫描日志 → 收集 8 帧窗口 → 复制唯一前视图像 → 写 index.json（日志级划分）。
 
-    窗口定义：输入 j-4..j-1（t-3..t），预测目标 j（t+1）；存相对帧 j-1 的 Δt/Δpose。
+    窗口定义：历史 j-3..j（4 帧输入），未来候选目标 j+1..j+4（多步长，训练时随机采 k）；
+    存相对当前帧 j 的 Δt/Δpose。与旧 5 帧缓存不兼容，需重新 prepare。
     """
     cache_root = Path(cache_root)
     (cache_root / "frames").mkdir(parents=True, exist_ok=True)
@@ -333,9 +338,9 @@ def prepare_pretext_dataset(cfg: Config, num_windows: int, cache_root: Path,
                 split = "val"
             else:
                 break
-            # 复制 5 帧图像（按帧文件名去重，同一物理图可被多个窗口共享）
+            # 复制 8 帧图像（按帧文件名去重，同一物理图可被多个窗口共享）
             ok = True
-            for k in range(j - 4, j + 1):
+            for k in range(j - 3, j + 5):
                 src = _image_path(log_name, frames[k], CAM_HISTORY)
                 dst = cache_root / "frames" / src.name
                 if not dst.is_file():
@@ -346,20 +351,20 @@ def prepare_pretext_dataset(cfg: Config, num_windows: int, cache_root: Path,
                         break
             if not ok:
                 continue
-            # 相对帧 j-1（当前帧 t）的位姿 / 时间差 / ego 动态
-            ego3 = frame_global_pose(frames[j - 1])
-            poses5 = absolute_to_relative_se2(
-                ego3, np.stack([frame_global_pose(frames[k]) for k in range(j - 4, j + 1)]))
-            dt5 = np.array([(frames[k]["timestamp"] - frames[j - 1]["timestamp"]) / 1e6
-                            for k in range(j - 4, j + 1)], dtype=np.float32)
-            dyn = np.asarray(frames[j - 1]["ego_dynamic_state"], dtype=np.float32)
-            cmd = np.asarray(frames[j - 1]["driving_command"], dtype=np.float32)
+            # 相对当前帧 j 的位姿 / 时间差 / ego 动态
+            ego3 = frame_global_pose(frames[j])
+            poses8 = absolute_to_relative_se2(
+                ego3, np.stack([frame_global_pose(frames[k]) for k in range(j - 3, j + 5)]))
+            dt8 = np.array([(frames[k]["timestamp"] - frames[j]["timestamp"]) / 1e6
+                            for k in range(j - 3, j + 5)], dtype=np.float32)
+            dyn = np.asarray(frames[j]["ego_dynamic_state"], dtype=np.float32)
+            cmd = np.asarray(frames[j]["driving_command"], dtype=np.float32)
             ego8 = np.concatenate([dyn, cmd]).astype(np.float32)[:8]
             tags = [_image_path(log_name, frames[k], CAM_HISTORY).name
-                    for k in range(j - 4, j + 1)]
-            index.append({"log_name": log_name, "anchor": int(j), "tags": tags,
-                          "dt5": [float(v) for v in dt5],
-                          "poses5": [[float(x) for x in p] for p in poses5],
+                    for k in range(j - 3, j + 5)]
+            index.append({"log_name": log_name, "anchor": int(j), "tags8": tags,
+                          "dt8": [float(v) for v in dt8],
+                          "poses8": [[float(x) for x in p] for p in poses8],
                           "ego8": [float(v) for v in ego8],
                           "split": split})
             if split == "train":
@@ -384,9 +389,10 @@ def prepare_pretext_dataset(cfg: Config, num_windows: int, cache_root: Path,
 
 
 class PretextDataset:
-    """5 帧前视窗口（stage 0 未来特征预测用）。
+    """8 帧前视窗口（stage 0 未来特征预测用，多步长版）。
 
-    返回 imgs (5,3,H,W)、dt5 (5,)、motion5 (5,3)（相对当前帧的 Δt/Δpose）、ego8 (8,)。
+    返回 imgs (8,3,H,W)、dt8 (8,)、motion8 (8,3)（均相对当前帧 f3）、ego8 (8,)。
+    历史 = f0..f3；目标 = f[3+k]，k∈[1, cfg.foresight_max_step] 由训练循环采样。
     """
 
     def __init__(self, cache_root: Path, cfg: Config, split: str = "train",
@@ -418,11 +424,11 @@ class PretextDataset:
     def __getitem__(self, idx: int) -> Dict[str, "torch.Tensor"]:
         import torch
         e = self.entries[idx]
-        imgs = np.stack([self._load_image(t) for t in e["tags"]])       # (5,3,H,W)
+        imgs = np.stack([self._load_image(t) for t in e["tags8"]])      # (8,3,H,W)
         return {
-            "imgs": torch.from_numpy(imgs),                              # 前 4 帧输入 + 第 5 帧目标
-            "dt5": torch.tensor(e["dt5"], dtype=torch.float32),          # (5,)
-            "motion5": torch.tensor(e["poses5"], dtype=torch.float32),   # (5,3) 相对当前帧 Δpose
+            "imgs": torch.from_numpy(imgs),                              # f0..f3 输入 + f4..f7 候选目标
+            "dt8": torch.tensor(e["dt8"], dtype=torch.float32),          # (8,)
+            "motion8": torch.tensor(e["poses8"], dtype=torch.float32),   # (8,3) 相对当前帧 Δpose
             "ego8": torch.tensor(e["ego8"], dtype=torch.float32),        # (8,)
         }
 

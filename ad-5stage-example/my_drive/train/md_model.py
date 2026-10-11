@@ -471,45 +471,100 @@ class LiteBEVHead(nn.Module):
             "det_heatmap": self.det_heatmap(up),
             "det_reg": self.det_reg(up),
         }
-class ForesightPredictor(nn.Module):
-    """逐 patch 位置的时序预测器（stage 0 用）：从 t-3..t 的 patch 特征预测
-    t+1 帧同位置**原始 DINO patch 特征**（384 维，目标全程冻结 → 不漂移、无 EMA）。
+class _ForesightBlock(nn.Module):
+    """时空可分离注意力块（借鉴 DINO-Foresight 的 separable attention）。
 
-    逐位置时序 attention（每位置 5 个 token）极轻量；空间上下文已由 DINO 自带。
+    每层 = 逐位置时序 attn（(B*P,T,d)）→ 逐帧空间 attn（(B*T,P,d)）→ FFN，
+    全部 pre-LN 残差。复杂度 O(P·T² + T·P²)，远低于全时空 attention 的 O((T·P)²)。
+    空间项让 t+1 的 mask query 能看到邻域位置的历史 → 运动目标跨 patch 的
+    特征迁移可学（旧版纯时序逐位置建模在结构上做不到这一点）。
     """
 
-    def __init__(self, cfg: Config, out_dim: int = 384):
+    def __init__(self, d: int, heads: int, dropout: float = 0.1,
+                 use_spatial: bool = True):
+        super().__init__()
+        self.use_spatial = use_spatial
+        self.ln_t = nn.LayerNorm(d)
+        self.attn_t = nn.MultiheadAttention(d, heads, dropout=0.0, batch_first=True)
+        if use_spatial:
+            self.ln_s = nn.LayerNorm(d)
+            self.attn_s = nn.MultiheadAttention(d, heads, dropout=0.0, batch_first=True)
+        self.ln_f = nn.LayerNorm(d)
+        self.ffn = nn.Sequential(nn.Linear(d, d * 2), nn.GELU(),
+                                 nn.Dropout(dropout), nn.Linear(d * 2, d))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B,T,P,d) → (B,T,P,d)。"""
+        B, T, P, d = x.shape
+        # ---- 时序：同一 patch 位置跨帧 ----
+        y = self.ln_t(x).permute(0, 2, 1, 3).reshape(B * P, T, d)
+        y = self.attn_t(y, y, y, need_weights=False)[0]
+        x = x + self.drop(y.reshape(B, P, T, d).permute(0, 2, 1, 3))
+        # ---- 空间：同一帧跨 patch 位置 ----
+        if self.use_spatial:
+            y = self.ln_s(x).reshape(B * T, P, d)
+            y = self.attn_s(y, y, y, need_weights=False)[0]
+            x = x + self.drop(y.reshape(B, T, P, d))
+        x = x + self.drop(self.ffn(self.ln_f(x)))
+        return x
+
+
+class ForesightPredictor(nn.Module):
+    """未来特征预测器（stage 0，DINO-Foresight 化版本）。
+
+    相对旧版的升级（均可在 Config 中开关回退，便于消融）：
+      1) 时空可分离注意力（foresight_spatial，默认开）：见 _ForesightBlock；
+      2) 预测目标 = 冻结目标分支的多层特征 concat（第 3/6/9/12 层，1536 维）
+         经 PCA 压缩到 foresight_pca_dim 维（foresight_target="pca"）；
+         "last" 回退为仅末层 384 维（旧行为）；
+      3) full-mask 查询 + 任意时距 Δt 查询：训练循环随机采 k∈[1, foresight_max_step]；
+      4) 深度 2 → foresight_layers（默认 6）。
+    输入侧仍是 patch_fuse 后的 d_model 维多帧特征；dt/ego Δpose 条件保留
+    （本仓库相对 DINO-Foresight 的驾驶场景特有项）。
+    """
+
+    def __init__(self, cfg: Config, out_dim: Optional[int] = None):
         super().__init__()
         d = cfg.d_model
         self.cfg = cfg
-        self.mask_q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        self.out_dim = out_dim or (cfg.foresight_pca_dim
+                                   if cfg.foresight_target == "pca"
+                                   else 384)
+        self.mask_q = nn.Parameter(torch.randn(1, 1, 1, d) * 0.02)
         self.dt_embed = nn.Linear(d, d)
         self.ego_motion_mlp = nn.Sequential(nn.Linear(3, d), nn.GELU(), nn.Linear(d, d))
-        layer = nn.TransformerEncoderLayer(d_model=d, nhead=cfg.planner_heads,
-                                           dim_feedforward=d * 2, dropout=0.1,
-                                           activation="gelu", batch_first=True,
-                                           norm_first=True)
-        self.encoder = nn.TransformerEncoder(layer, num_layers=2)
+        self.blocks = nn.ModuleList([
+            _ForesightBlock(d, cfg.foresight_heads, dropout=0.1,
+                            use_spatial=cfg.foresight_spatial)
+            for _ in range(cfg.foresight_layers)])
         self.out_norm = nn.LayerNorm(d)
-        self.pred = nn.Linear(d, out_dim)
-    def forward(self, patch_hist: torch.Tensor, dt5: torch.Tensor,
-                motion5: torch.Tensor) -> torch.Tensor:
+        self.pred = nn.Linear(d, self.out_dim)
+
+    def forward(self, patch_hist: torch.Tensor, dt_hist: torch.Tensor,
+                motion_hist: torch.Tensor, dt_q: torch.Tensor,
+                motion_q: torch.Tensor) -> torch.Tensor:
         """
-        :param patch_hist: (B,4,P=960,d) 输入帧 t-3..t 的 patch 特征（在线分支）
-        :param dt5: (B,5) 各帧（含目标帧 t+1）相对 t 的 Δt（秒）
-        :param motion5: (B,5,3) 各帧（含目标帧）相对 t 的 Δpose
-        :return: (B,P,out_dim) 预测的 t+1 原始 patch 特征
+        :param patch_hist: (B,T,P,d) 历史帧 patch 特征（在线分支，patch_fuse 后）
+        :param dt_hist: (B,T) 历史帧相对当前帧的 Δt（秒，≤0）
+        :param motion_hist: (B,T,3) 历史帧相对当前帧的 Δpose
+        :param dt_q: (B,1) 目标帧 Δt（>0）
+        :param motion_q: (B,1,3) 目标帧 Δpose
+        :return: (B,P,out_dim) 预测的目标帧特征（PCA 空间或末层原始特征）
         """
-        B, nf, P, d = patch_hist.shape
-        x = patch_hist.permute(0, 2, 1, 3).reshape(B * P, nf, d)
-        pe = self.dt_embed(sinusoidal_dt(dt5[:, :4], d))
-        mpe = self.ego_motion_mlp(motion5[:, :4])
-        x = x + (pe + mpe)[:, None].expand(B, P, nf, d).reshape(B * P, nf, d)
-        pe_q = self.dt_embed(sinusoidal_dt(dt5[:, 4:], d)) \
-            + self.ego_motion_mlp(motion5[:, 4:])
-        q = (self.mask_q + pe_q)[:, None].expand(B, P, 1, d).reshape(B * P, 1, d)
-        out = self.out_norm(self.encoder(torch.cat([x, q], dim=1)))
-        return self.pred(out[:, -1]).reshape(B, P, -1)
+        B, T, P, d = patch_hist.shape
+        pe = self.dt_embed(sinusoidal_dt(dt_hist, d))            # (B,T,d)
+        mpe = self.ego_motion_mlp(motion_hist)                   # (B,T,d)
+        x = patch_hist + (pe + mpe)[:, :, None]                  # (B,T,P,d)
+        pe_q = self.dt_embed(sinusoidal_dt(dt_q, d)) \
+            + self.ego_motion_mlp(motion_q)                      # (B,1,d)
+        q = (self.mask_q + pe_q[:, :, None]).expand(B, 1, P, d)  # full-mask 查询
+        x = torch.cat([x, q], dim=1)                             # (B,T+1,P,d)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.pred(self.out_norm(x[:, -1]))                # (B,P,out_dim)
+
+
 class MyDriveModel(nn.Module):
     """DINOv3+LoRA 多帧编码 + 时序 planner + lite BEV 头。
 
@@ -532,6 +587,16 @@ class MyDriveModel(nn.Module):
             torch.randn(1, 4, cfg.num_scene_tokens, embed_dim) * 0.02)  # (1,4,16,384)
         self.planner = ProposalPlanner(cfg)
         self.bev_head = LiteBEVHead(cfg)
+        # ---- foresight PCA 目标（stage 0）：由 md_pretext prepare-pca 离线生成、
+        # load_foresight_pca 载入。注册为 buffer → 随 checkpoint 保存/加载、随 .to() 迁移。
+        # 恒等占位 + ready=0：未载入 PCA 就在 pca 模式下前向会显式报错（见 forward_foresight）。
+        in_dim = self.encoder.embed_dim * 4                     # 4 层 concat = 1536
+        self.register_buffer("foresight_pca_mean", torch.zeros(in_dim))
+        self.register_buffer(
+            "foresight_pca_comp",
+            torch.eye(in_dim)[: cfg.foresight_pca_dim].clone())  # (pca_dim, in_dim) 占位
+        self.register_buffer("foresight_pca_ready",
+                             torch.zeros((), dtype=torch.uint8))
 
     def _encode(self, imgs: torch.Tensor, cams: List[int], need_patch: bool = True,
                 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -591,21 +656,56 @@ class MyDriveModel(nn.Module):
         for p in self._tgt_encoder.parameters():
             p.requires_grad = False
         self._tgt_scene_embeds = self.scene_embeds.detach().clone()
+    def load_foresight_pca(self, pca_path) -> None:
+        """载入 prepare-pca 生成的 PCA 矩阵（mean + components）。"""
+        d = torch.load(str(pca_path), map_location="cpu", weights_only=True)
+        assert d["components"].shape == tuple(self.foresight_pca_comp.shape), \
+            f"PCA 维度不符：{d['components'].shape} vs {tuple(self.foresight_pca_comp.shape)}"
+        self.foresight_pca_mean.copy_(d["mean"].float())
+        self.foresight_pca_comp.copy_(d["components"].float())
+        self.foresight_pca_ready.fill_(1)
+        print(f"[foresight] PCA 目标已载入（{d.get('n_samples', '?')} 样本，"
+              f"explained_var={d.get('explained_var', float('nan')):.3f}）")
+
+    def foresight_target_from(self, img: torch.Tensor) -> torch.Tensor:
+        """冻结目标分支提目标帧特征：pca 模式 = 4 层 concat(1536)→PCA 投影；
+        last 模式 = 仅末层 384 维（旧行为，消融用）。img: (B,3,H,W)。"""
+        B = img.shape[0]
+        st = self._tgt_scene_embeds[:, 0].expand(B, -1, -1)
+        final, inters = self._tgt_encoder.model.forward_features(img, st)
+        n_pre = self._tgt_encoder.n_prefix
+        if self.cfg.foresight_target == "pca":
+            if not bool(self.foresight_pca_ready):
+                raise RuntimeError(
+                    "foresight_target='pca' 但未载入 PCA 矩阵："
+                    "先运行 python -m my_drive.train.md_pretext prepare-pca，"
+                    "或将 cfg.foresight_target 改为 'last'")
+            raw = torch.cat([t[:, n_pre:] for t in inters] + [final[:, n_pre:]],
+                            dim=-1)                              # (B,P,1536)
+            return (raw.float() - self.foresight_pca_mean) @ self.foresight_pca_comp.T
+        return final[:, n_pre:]                                  # (B,P,384)
+
     def forward_foresight(self, batch: Dict[str, torch.Tensor], predictor: nn.Module,
+                          future_step: int = 1,
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回 (预测 t+1 patch 特征 (B,P,384), 目标原始 patch 特征 (B,P,384))。
+        """返回 (预测目标帧特征 (B,P,out_dim), 目标特征 (B,P,out_dim))。
+
+        多步长（DINO-Foresight full-mask + 随机时距）：batch 为 8 帧窗口
+        f0..f7 = t-3..t+4（前 4 帧历史，后 4 帧候选目标），目标 = f[3+future_step]，
+        k∈[1, cfg.foresight_max_step] 由训练循环随机采样（0.5/1.0/1.5/2.0s）。
 
         在线分支：t-3..t 四帧 patch 特征（带梯度）；
-        目标分支：t+1 帧走完全冻结的编码器副本（no_grad），目标不漂移。
+        目标分支：目标帧走完全冻结的编码器副本（no_grad），目标不漂移。
         """
-        imgs = batch["imgs"]
-        B = imgs.shape[0]
+        imgs = batch["imgs"]                                     # (B,8,3,H,W)
+        k = int(future_step)
         _, patch_in = self._encode(imgs[:, :4], cams=[0, 0, 0, 0], need_patch=True)
         with torch.no_grad():
-            st = self._tgt_scene_embeds[:, 0].expand(B, -1, -1)
-            final, _ = self._tgt_encoder.model.forward_features(imgs[:, 4], st)
-            tgt = final[:, self._tgt_encoder.n_prefix:]
-        pred = predictor(patch_in, batch["dt5"], batch["motion5"])
+            tgt = self.foresight_target_from(imgs[:, 3 + k])
+        pred = predictor(patch_in,
+                         batch["dt8"][:, :4], batch["motion8"][:, :4],
+                         batch["dt8"][:, 3 + k: 4 + k],
+                         batch["motion8"][:, 3 + k: 4 + k])
         return pred, tgt
     def param_groups(self) -> Dict[str, List[nn.Parameter]]:
         """按模块名分组参数：dino（主干，恒冻结）/ lora / planner / bev。

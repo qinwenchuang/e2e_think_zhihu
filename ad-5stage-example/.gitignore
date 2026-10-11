@@ -1,1 +1,5 @@
 my_drive/workspace
+my_drive/__pycache__
+my_drive/data/__pycache__/
+my_drive/eval/__pycache__/
+my_drive/train/__pycache__/

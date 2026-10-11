@@ -26,6 +26,8 @@
 #   SKIP_PRETEXT=1 跳过 stage 0；SKIP_GRPO=1 跳过 stage 1.5（stage 2 改从 stage 1 初始化）
 #   PREP_DATA=1   缓存缺失时自动构建有标签缓存（TRAIN/VAL/TEST_COUNT 控制数量）
 #   PREP_PRETEXT=1 缓存缺失时自动构建 pretext 缓存（NUM_WINDOWS 控制窗口数）
+#                 注意：新版为 8 帧多步长窗口，与旧 5 帧缓存不兼容
+#                 pca 模式下 train 前会自动补跑 prepare-pca（若 pca.pt 缺失）
 #   MAX_LOGS      数据准备时最多扫描的日志数（默认 2000）
 #   EXTRA         追加给 md_train 的额外参数（如 --limit-batches 4 --no-tb）
 #   DRY_RUN=1     只打印命令不执行
@@ -94,6 +96,11 @@ elif [ "${SKIP_PRETEXT}" = "1" ]; then
     echo "stage 0 跳过（SKIP_PRETEXT=1）→ stage 1 从随机初始化开始"
 elif [ -f "$PRETEXT_CACHE/index.json" ] && has_val "$PRETEXT_CACHE/index.json"; then
     echo "==================== stage 0: pretext（未来特征预测）===================="
+    # PCA 目标矩阵（foresight_target="pca" 必需，缺失时自动预计算）
+    if [ ! -f "$PRETEXT_CACHE/pca.pt" ]; then
+        echo "---- prepare-pca：预计算 PCA 目标矩阵 ----"
+        run python -m my_drive.train.md_pretext prepare-pca --cache-root "$PRETEXT_CACHE"
+    fi
     run python -m my_drive.train.md_pretext train --epochs "$EPOCHS0" --lr "$LR0" \
         --cache-root "$PRETEXT_CACHE" --out-dir "$RUNS/stage0" \
         --batch-size $BATCH --grad-accum $ACCUM --num-workers $WORKERS --patience $PATIENCE
