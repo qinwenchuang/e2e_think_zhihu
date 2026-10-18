@@ -14,10 +14,15 @@
   BEV 头仅用当前帧 4 路 patch 特征：50×50 query × 固定 3D 参考点（4 高度 × 2×2 子点）
   投影采样 → 3 层 [self-attn + spatial cross-attn + FFN] → 地图分割 / 检测头。
 
+stage 0（foresight）新增 AD-E2E-JEPA 化的 "proj" 模式（arXiv:2609.34085）：
+  可学习 PatchProjector（stride-2 卷积 ×2，patch 16×↓、维度 4×↓，两分支共享）
+  + SIGReg 防坍缩 + 目标侧 stop-gradient + 可选 TBPTT rollout 一致性损失。
+  "pca" / "last" 模式保留作消融回退，行为与旧版完全一致。
+
 全局符号约定：
   B    batch；M 一次编码图像数（当前帧 M=4 / 历史 M=3 / pretext M=5）
   H,W  图像高宽 = 384, 640；S 每相机 scene token = 16
-  E   DINOv3 特征维 = 384；d 模型维 = 256
+  E   DINOv3 特征维 = 384；d 模型维 = 256；dp 投影维 = 64（proj 模式）
   gh,gw patch 网格 = 24×40（960 patch）；G BEV 网格 = 50（N = 2500 query）
   n_h BEV 高度采样 = 4；S2 cell 子点 = 2×2；NC 相机数 = 4
 """
@@ -171,6 +176,55 @@ def sinusoidal_dt(dt_seconds: torch.Tensor, dim: int, scale: float = 1.0) -> tor
                                                         dtype=torch.float32) / half)
     args = (dt_seconds[..., None] * scale) * freqs     # (...,128)
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (...,256)
+
+
+class PatchProjector(nn.Module):
+    """可学习 patch projector（AD-E2E-JEPA 核心组件，arXiv:2609.34085 Fig.2 a.1）。
+
+    两个 stride-2 卷积：24×40 patch 网格 → 12×20 → 6×10（16× 更少 patch），
+    通道 d_model(256) → proj_dim(64)（4× 降维）。在线分支与目标分支共享
+    （论文 Eq.7），预测器/规划全部在投影后的紧凑空间进行 → rollout 成本 ~64×↓。
+    GroupNorm 而非 BatchNorm：与 BEV trunk 同理，小 batch 下 BN 统计噪声大。
+
+    forward: (N, gh*gw, d) patch 序列 → (N, (gh//4)*(gw//4), proj_dim)。
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        d = cfg.d_model                                # 256
+        p = cfg.foresight_proj_dim                     # 64
+        self.conv1 = nn.Conv2d(d, p * 2, kernel_size=3, stride=2, padding=1)
+        self.norm1 = nn.GroupNorm(8, p * 2)
+        self.conv2 = nn.Conv2d(p * 2, p, kernel_size=3, stride=2, padding=1)
+        self.norm2 = nn.GroupNorm(8, p)
+        self.act = nn.GELU()
+
+    def forward(self, feats: torch.Tensor, gh: int, gw: int) -> torch.Tensor:
+        # (N, gh*gw, d) → (N, d, gh, gw)：先 transpose 再 reshape，
+        # 避免通道与空间维交错混排（与 LiteBEVHead.forward 中的教训一致）
+        x = feats.transpose(1, 2).reshape(feats.shape[0], -1, gh, gw)
+        x = self.act(self.norm1(self.conv1(x)))        # (N, 2p, gh/2, gw/2)
+        x = self.norm2(self.conv2(x))                  # (N, p, gh/4, gw/4)
+        return x.flatten(2).transpose(1, 2)            # (N, gh*gw/16, p)
+
+
+def _se2_rebase(poses: torch.Tensor, origin: int) -> torch.Tensor:
+    """poses (B,N,3)（同一参考系下的相对位姿）→ 以第 origin 个位姿为新原点 (B,N,3)。
+
+    rollout 逐步推进时，dt/motion 条件需要从「相对帧 t」重基到「相对帧 t+j」；
+    θ 用 atan2(sin,cos) 包角，等价 normalize_angle 的可微版本。
+    """
+    o = poses[:, origin]                               # (B,3)
+    c, s = torch.cos(-o[:, 2]), torch.sin(-o[:, 2])
+    dx = poses[..., 0] - o[:, 0:1]
+    dy = poses[..., 1] - o[:, 1:2]
+    x = c[:, None] * dx - s[:, None] * dy
+    y = s[:, None] * dx + c[:, None] * dy
+    dth = poses[..., 2] - o[:, 2:3]
+    th = torch.atan2(torch.sin(dth), torch.cos(dth))
+    return torch.stack([x, y, th], dim=-1)
+
+
 class _DecoderBlock(nn.Module):
     """planner/scorer 共用 transformer 块：self-attn → cross-attn → FFN（pre-LN 残差）。
 
@@ -471,6 +525,8 @@ class LiteBEVHead(nn.Module):
             "det_heatmap": self.det_heatmap(up),
             "det_reg": self.det_reg(up),
         }
+
+
 class _ForesightBlock(nn.Module):
     """时空可分离注意力块（借鉴 DINO-Foresight 的 separable attention）。
 
@@ -511,26 +567,33 @@ class _ForesightBlock(nn.Module):
 
 
 class ForesightPredictor(nn.Module):
-    """未来特征预测器（stage 0，DINO-Foresight 化版本）。
+    """未来特征预测器（stage 0，DINO-Foresight 化 + AD-E2E-JEPA "proj" 模式）。
 
     相对旧版的升级（均可在 Config 中开关回退，便于消融）：
       1) 时空可分离注意力（foresight_spatial，默认开）：见 _ForesightBlock；
-      2) 预测目标 = 冻结目标分支的多层特征 concat（第 3/6/9/12 层，1536 维）
-         经 PCA 压缩到 foresight_pca_dim 维（foresight_target="pca"）；
-         "last" 回退为仅末层 384 维（旧行为）；
+      2) 预测目标三选一（foresight_target）：
+         - "pca"：冻结目标分支多层 concat（1536 维）→ 离线 PCA → foresight_pca_dim；
+         - "last"：仅末层 384 维（旧行为）；
+         - "proj"：共享可学习 PatchProjector 的投影空间（foresight_proj_dim 维，
+           patch 数同时 16×↓），预测器直接在投影空间运行（论文 Eq.8），
+           注意力复杂度较 pca 模式降 ~16×，且预测结果可直接用于 rollout/规划；
       3) full-mask 查询 + 任意时距 Δt 查询：训练循环随机采 k∈[1, foresight_max_step]；
       4) 深度 2 → foresight_layers（默认 6）。
-    输入侧仍是 patch_fuse 后的 d_model 维多帧特征；dt/ego Δpose 条件保留
-    （本仓库相对 DINO-Foresight 的驾驶场景特有项）。
+    dt/ego Δpose 条件保留（本仓库相对 DINO-Foresight 的驾驶场景特有项，
+    对应论文的 action conditioning Eq.3/5：Δpose 即相对位姿动作）。
     """
 
     def __init__(self, cfg: Config, out_dim: Optional[int] = None):
         super().__init__()
-        d = cfg.d_model
+        # proj 模式：预测器全程在投影空间（dp 维、60 patch）运行；
+        # pca/last 模式：输入为 patch_fuse 后的 d_model 维（旧行为）
+        d = cfg.foresight_proj_dim if cfg.foresight_target == "proj" else cfg.d_model
         self.cfg = cfg
-        self.out_dim = out_dim or (cfg.foresight_pca_dim
-                                   if cfg.foresight_target == "pca"
-                                   else 384)
+        self.dim = d
+        self.out_dim = out_dim or (
+            cfg.foresight_proj_dim if cfg.foresight_target == "proj"
+            else cfg.foresight_pca_dim if cfg.foresight_target == "pca"
+            else 384)
         self.mask_q = nn.Parameter(torch.randn(1, 1, 1, d) * 0.02)
         self.dt_embed = nn.Linear(d, d)
         self.ego_motion_mlp = nn.Sequential(nn.Linear(3, d), nn.GELU(), nn.Linear(d, d))
@@ -545,12 +608,13 @@ class ForesightPredictor(nn.Module):
                 motion_hist: torch.Tensor, dt_q: torch.Tensor,
                 motion_q: torch.Tensor) -> torch.Tensor:
         """
-        :param patch_hist: (B,T,P,d) 历史帧 patch 特征（在线分支，patch_fuse 后）
+        :param patch_hist: (B,T,P,d) 历史帧 patch 特征（pca/last：在线分支 patch_fuse 后；
+            proj：PatchProjector 后的投影特征）
         :param dt_hist: (B,T) 历史帧相对当前帧的 Δt（秒，≤0）
         :param motion_hist: (B,T,3) 历史帧相对当前帧的 Δpose
         :param dt_q: (B,1) 目标帧 Δt（>0）
         :param motion_q: (B,1,3) 目标帧 Δpose
-        :return: (B,P,out_dim) 预测的目标帧特征（PCA 空间或末层原始特征）
+        :return: (B,P,out_dim) 预测的目标帧特征（投影 / PCA / 末层原始特征空间）
         """
         B, T, P, d = patch_hist.shape
         pe = self.dt_embed(sinusoidal_dt(dt_hist, d))            # (B,T,d)
@@ -587,9 +651,14 @@ class MyDriveModel(nn.Module):
             torch.randn(1, 4, cfg.num_scene_tokens, embed_dim) * 0.02)  # (1,4,16,384)
         self.planner = ProposalPlanner(cfg)
         self.bev_head = LiteBEVHead(cfg)
-        # ---- foresight PCA 目标（stage 0）：由 md_pretext prepare-pca 离线生成、
-        # load_foresight_pca 载入。注册为 buffer → 随 checkpoint 保存/加载、随 .to() 迁移。
-        # 恒等占位 + ready=0：未载入 PCA 就在 pca 模式下前向会显式报错（见 forward_foresight）。
+        # ---- foresight projector（stage 0 "proj" 模式；其余模式不参与前向） ----
+        # 恒创建：① 权重随 checkpoint 保存，stage 0 训出的 projector 可被下游
+        # 阶段/迁移实验直接复用（论文 §3.4：预训练 projector 提升下游模仿学习）；
+        # ② 加载旧 checkpoint 时 strict=False 下该模块随机初始化，无副作用。
+        self.foresight_projector = PatchProjector(cfg)
+        # ---- foresight PCA 目标（stage 0 "pca" 模式）：由 md_pretext prepare-pca
+        # 离线生成、load_foresight_pca 载入。注册为 buffer → 随 checkpoint 保存/加载、
+        # 随 .to() 迁移。恒等占位 + ready=0：未载入 PCA 就在 pca 模式下前向会显式报错。
         in_dim = self.encoder.embed_dim * 4                     # 4 层 concat = 1536
         self.register_buffer("foresight_pca_mean", torch.zeros(in_dim))
         self.register_buffer(
@@ -685,36 +754,116 @@ class MyDriveModel(nn.Module):
             return (raw.float() - self.foresight_pca_mean) @ self.foresight_pca_comp.T
         return final[:, n_pre:]                                  # (B,P,384)
 
+    def _foresight_target_patch(self, img: torch.Tensor) -> torch.Tensor:
+        """冻结目标分支的 patch_fuse 特征 (B,P,d_model)（proj 模式目标侧输入）。
+
+        目标分支整体冻结（deepcopy 于 stage 0 起点）→ 256 维目标特征不漂移；
+        共享 projector 的可训练性由损失侧控制（pred loss 中 sg，SIGReg 保留梯度，
+        论文 Eq.9/10）。
+        """
+        B = img.shape[0]
+        st = self._tgt_scene_embeds[:, 0].expand(B, -1, -1)
+        final, inters = self._tgt_encoder.model.forward_features(img, st)
+        n_pre = self._tgt_encoder.n_prefix
+        raw = torch.cat([t[:, n_pre:] for t in inters] + [final[:, n_pre:]],
+                        dim=-1)                                  # (B,P,1536)
+        return self._tgt_encoder.patch_fuse(raw)                 # (B,P,256)
+
+    def _project_patches(self, patch: torch.Tensor) -> torch.Tensor:
+        """patch_fuse 特征 (B,T,gh*gw,d) → 共享 projector 投影 (B,T,(gh//4)(gw//4),dp)。"""
+        B, T = patch.shape[:2]
+        z = self.foresight_projector(
+            patch.reshape(B * T, *patch.shape[2:]), self.gh, self.gw)
+        return z.reshape(B, T, *z.shape[1:])
+
     def forward_foresight(self, batch: Dict[str, torch.Tensor], predictor: nn.Module,
                           future_step: int = 1,
-                          ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回 (预测目标帧特征 (B,P,out_dim), 目标特征 (B,P,out_dim))。
+                          ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """返回 (预测目标帧特征, 目标特征, aux)。
 
         多步长（DINO-Foresight full-mask + 随机时距）：batch 为 8 帧窗口
         f0..f7 = t-3..t+4（前 4 帧历史，后 4 帧候选目标），目标 = f[3+future_step]，
         k∈[1, cfg.foresight_max_step] 由训练循环随机采样（0.5/1.0/1.5/2.0s）。
 
         在线分支：t-3..t 四帧 patch 特征（带梯度）；
-        目标分支：目标帧走完全冻结的编码器副本（no_grad），目标不漂移。
+        目标分支：目标帧走完全冻结的编码器副本（特征提取 no_grad），目标不漂移。
+
+        "proj" 模式（AD-E2E-JEPA）：两侧 patch_fuse 特征经共享 projector 压缩后
+        预测/监督（目标侧在损失中 sg，见 md_pretext）；aux 含 z_hist / z_tgt
+        （保留 projector 梯度，供 SIGReg 使用，论文 Eq.10）。
+        "pca"/"last" 模式：行为与旧版一致，aux 为空 dict。
         """
         imgs = batch["imgs"]                                     # (B,8,3,H,W)
         k = int(future_step)
         _, patch_in = self._encode(imgs[:, :4], cams=[0, 0, 0, 0], need_patch=True)
+        if self.cfg.foresight_target == "proj":
+            z_hist = self._project_patches(patch_in)             # (B,4,P',dp)
+            with torch.no_grad():
+                tgt_feat = self._foresight_target_patch(imgs[:, 3 + k])
+            z_tgt = self.foresight_projector(tgt_feat, self.gh, self.gw)  # (B,P',dp)
+            pred = predictor(z_hist,
+                             batch["dt8"][:, :4], batch["motion8"][:, :4],
+                             batch["dt8"][:, 3 + k: 4 + k],
+                             batch["motion8"][:, 3 + k: 4 + k])
+            return pred, z_tgt, {"z_hist": z_hist, "z_tgt": z_tgt}
         with torch.no_grad():
             tgt = self.foresight_target_from(imgs[:, 3 + k])
         pred = predictor(patch_in,
                          batch["dt8"][:, :4], batch["motion8"][:, :4],
                          batch["dt8"][:, 3 + k: 4 + k],
                          batch["motion8"][:, 3 + k: 4 + k])
-        return pred, tgt
+        return pred, tgt, {}
+
+    def forward_foresight_rollout(
+            self, batch: Dict[str, torch.Tensor], predictor: nn.Module,
+            num_steps: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """proj 模式可选：自回归 rollout（论文 Eq.12 / A.2.2，TBPTT 截断反传）。
+
+        从初始上下文 z_{t-3..t} 出发逐步预测 f4..f[3+num_steps]：
+        每步上下文丢弃最旧帧、追加最新预测；首步上下文保留梯度（复用 TF 链），
+        后续步对上下文 sg（TBPTT，梯度不回穿更早的 rollout 步）。
+        dt/motion 条件逐步用 _se2_rebase 重基到新的当前帧（论文 Eq.3 的相对位姿
+        动作在移动原点下的等价变换）。
+
+        :return: preds、z_tgts 各 num_steps 个 (B,P',dp)；z_tgts 保留 projector
+                 梯度（供 SIGReg），pred 监督时在损失侧 sg 目标。
+        """
+        assert self.cfg.foresight_target == "proj", "rollout 仅在 proj 模式下可用"
+        imgs, dt8, mo8 = batch["imgs"], batch["dt8"], batch["motion8"]
+        _, patch_in = self._encode(imgs[:, :4], cams=[0, 0, 0, 0], need_patch=True)
+        z_ctx = self._project_patches(patch_in)                  # (B,4,P',dp)
+        preds: List[torch.Tensor] = []
+        tgts: List[torch.Tensor] = []
+        for j in range(1, num_steps + 1):
+            cur = 3 + j - 1                                      # 当前帧下标
+            win = slice(j - 1, j - 1 + 4)                        # 上下文窗口 j-1..j+2
+            dt_hist = dt8[:, win] - dt8[:, cur:cur + 1]          # 重基到当前帧
+            mo_hist = _se2_rebase(mo8[:, win], 3)                # 窗口末帧 = 当前帧
+            dt_q = (dt8[:, 3 + j] - dt8[:, cur])[:, None]        # (B,1)
+            mo_q = _se2_rebase(torch.stack([mo8[:, cur], mo8[:, 3 + j]], dim=1),
+                               0)[:, 1:2]                        # (B,1,3)
+            ctx_in = z_ctx if j == 1 else z_ctx.detach()         # TBPTT
+            pred = predictor(ctx_in, dt_hist, mo_hist, dt_q, mo_q)
+            with torch.no_grad():
+                tgt_feat = self._foresight_target_patch(imgs[:, 3 + j])
+            z_tgt = self.foresight_projector(tgt_feat, self.gh, self.gw)
+            preds.append(pred)
+            tgts.append(z_tgt)
+            # 滑窗：丢最旧帧、追加最新预测（论文 Eq.22）
+            z_ctx = torch.cat([z_ctx[:, 1:], pred[:, None]], dim=1)
+        return preds, tgts
+
     def param_groups(self) -> Dict[str, List[nn.Parameter]]:
-        """按模块名分组参数：dino（主干，恒冻结）/ lora / planner / bev。
+        """按模块名分组参数：dino（主干，恒冻结）/ lora / planner / bev / foresight。
 
         - encoder.* 中 LoRA 支路（linear_a_/linear_b_）与 neck/patch_fuse 归 lora；
           encoder 其余（ViT 权重）归 dino（恒冻结）；
-        - scene_embeds 归 lora；planner.* 归 planner；bev_head.* 归 bev。
+        - scene_embeds 归 lora；planner.* 归 planner；bev_head.* 归 bev；
+        - foresight_projector.* 归 foresight（仅 stage 0 "proj" 模式训练；
+          stage 1-3 恒冻结，见 set_train_stage）。
         """
-        groups: Dict[str, List[nn.Parameter]] = {"dino": [], "lora": [], "planner": [], "bev": []}
+        groups: Dict[str, List[nn.Parameter]] = {
+            "dino": [], "lora": [], "planner": [], "bev": [], "foresight": []}
         for name, p in self.named_parameters():
             if name.startswith("encoder."):
                 if ("linear_a_" in name or "linear_b_" in name or ".neck." in name
@@ -728,6 +877,8 @@ class MyDriveModel(nn.Module):
                 groups["planner"].append(p)
             elif name.startswith("bev_head."):
                 groups["bev"].append(p)
+            elif name.startswith("foresight_projector."):
+                groups["foresight"].append(p)
             else:
                 groups["planner"].append(p)
         return groups
@@ -737,6 +888,9 @@ class MyDriveModel(nn.Module):
         stage 1: 冻结 DINO；LoRA + Planner 可训（不前向 BEV）
         stage 2: 冻结 DINO + LoRA + Planner；BEV 可训（DINO 前向 no_grad，省显存）
         stage 3: 冻结 DINO；LoRA + Planner + BEV 可训（联合）
+
+        foresight_projector 在 stage 1-3 恒冻结（不参与下游前向；
+        如需按论文 §3.4 把预训练 projector 迁移进下游结构，另行接入）。
         """
         trainable = {
             1: {"lora": True, "planner": True, "bev": False},
@@ -745,6 +899,8 @@ class MyDriveModel(nn.Module):
         }[stage]
         groups = self.param_groups()
         for p in groups["dino"]:
+            p.requires_grad = False
+        for p in groups["foresight"]:
             p.requires_grad = False
         for gname, flag in trainable.items():
             for p in groups[gname]:

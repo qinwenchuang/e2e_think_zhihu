@@ -92,11 +92,32 @@ class Config:
     foresight_layers: int = 6                         # 预测器深度（时空可分离块数）
     foresight_heads: int = 8                          # 预测器注意力头数
     foresight_spatial: bool = True                    # False=纯时序注意力（回退旧行为，消融用）
-    foresight_target: str = "pca"                     # "pca"=多层concat+PCA；"last"=仅末层384维（旧行为）
+    foresight_target: str = "pca"                     # "pca"=多层concat+PCA；"last"=仅末层384维（旧行为）；
+                                                      # "proj"=可学习projector+SIGReg（AD-E2E-JEPA 化，见下）
     foresight_pca_dim: int = 512                      # PCA 目标维度（输入侧 4 层×384=1536）
     foresight_max_step: int = 4                       # 最大预测时距（×0.5s）；1=旧单步行为（消融用）
     foresight_pca_windows: int = 2000                 # prepare-pca 采样窗口数
     foresight_pca_patches: int = 128                  # 每窗口随机采样 patch 数
+    # ---- foresight "proj" 模式（AD-E2E-JEPA，arXiv:2609.34085） ----
+    # 可学习 patch projector（两层 stride-2 卷积，在线/目标分支共享，论文 Fig.2 a.1）：
+    #   patch 数 16×↓（24×40 → 6×10 = 60），嵌入维 4×↓（d_model 256 → proj_dim 64），
+    #   预测器在投影空间运行，rollout/规划成本随之 ~64×↓（论文报告 100× 推理加速）。
+    foresight_proj_dim: int = 64                      # 投影维度（d_model 的 1/4）
+    # SIGReg（论文 Eq.10/11）：Epps–Pulley 检验把投影嵌入的随机 1 维投影拉向
+    # 各向同性标准正态，防止可学习 projector 坍缩（target 侧在 pred loss 中 sg，
+    # projector 在目标支路的梯度仅来自 SIGReg）。
+    foresight_sigreg_weight: float = 0.09             # λ（论文默认 0.09；有效 batch 大时需下调）
+    foresight_sigreg_dirs: int = 256                  # 随机投影方向数 M（论文 1024；小 batch 用 256 足够且快）
+    foresight_sigreg_knots: int = 17                  # EP 积分结点数（[0,3] 均匀 17 点，LeJEPA 默认）
+    # 可选自回归 rollout 一致性损失（论文 Eq.12 / A.2.2，TBPTT 截断反传）：
+    # 论文中显著提升 geodesic 精度与 hit rate（FDE 4.2→3.2m，top-1 27%→47%），
+    # 代价是每 batch 多 ~1 次历史编码 + F 次预测器前向，默认关。
+    foresight_rollout: bool = False
+    foresight_rollout_weight: float = 1.0             # rollout 项相对单步 TF 项的权重
+    # val 时的规划诊断（借鉴论文 §3.3.2 hit rate）：以真实未来帧投影特征为 goal，
+    # 候选 = GT (Δt,Δpose) 查询 + batch 内其他样本的查询（负样本），
+    # 统计 GT 候选潜在距离最小的比例（hit@1）。proj 模式专用，B≥2 时有效。
+    foresight_plan_eval: bool = True
 
     # ---- 训练 ----
     batch_size: int = 2

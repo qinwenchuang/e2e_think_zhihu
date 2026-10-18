@@ -1,25 +1,44 @@
 """md_pretext：stage 0 —— 未来特征预测（Foresight pretext，自监督，无标签）。
 
-DINO-Foresight 化版本（相对旧版四项升级，均可经 Config 回退消融）：
+DINO-Foresight 化 + AD-E2E-JEPA 化版本（相对旧版升级，均可经 Config 回退消融）：
   1) 预测器：时空可分离注意力（_ForesightBlock，cfg.foresight_spatial）；
-  2) 预测目标：冻结目标分支的多层特征 concat（第 3/6/9/12 层，1536 维）经 PCA
-     压缩到 cfg.foresight_pca_dim 维（cfg.foresight_target="pca"），"last" 回退
-     为仅末层 384 维旧行为。PCA 由 prepare-pca 离线预计算；
+  2) 预测目标三选一（cfg.foresight_target）：
+     - "pca"：冻结目标分支的多层特征 concat（第 3/6/9/12 层，1536 维）经 PCA
+       压缩到 cfg.foresight_pca_dim 维，PCA 由 prepare-pca 离线预计算；
+     - "last"：仅末层 384 维（旧行为）；
+     - "proj"：可学习 PatchProjector + SIGReg（AD-E2E-JEPA，arXiv:2609.34085）。
+       两个 stride-2 卷积把 24×40 patch 网格压到 6×10（16× 更少 patch）、
+       256 维压到 64 维（4× 降维），在线/目标分支共享（论文 Eq.7-9）；
+       目标侧 stop-gradient，SIGReg（Epps–Pulley 检验）把投影嵌入拉向各向同性
+       标准正态以防 projector 坍缩（论文 Eq.10/11）。预测器在投影空间运行，
+       注意力成本 ~16×↓，且预测特征可直接用于 rollout 与规划。
   3) 多步长：8 帧窗口（4 历史 + 4 未来候选），训练随机采 k∈[1, foresight_max_step]，
      验证按 k=1..4 分别报告（早停准则 = 各时距 val_loss 均值）；
   4) 分辨率课程：--image-size 可先低分辨率训练、再 --init-from 热启动高分辨率
-     （patch 网格随 cfg.image_size 自适应，缓存与分辨率无关，无需重新 prepare）。
+     （patch 网格随 cfg.image_size 自适应，缓存与分辨率无关，无需重新 prepare）；
+  5) 可选自回归 rollout 一致性损失（--rollout，论文 Eq.12/A.2.2，TBPTT）：
+     论文中显著提升 geodesic 精度与 hit rate（FDE 4.2→3.2m，top-1 27%→47%），
+     代价是每 batch 多 ~1 次历史编码 + F 次预测器前向。仅 proj 模式可用；
+  6) val 规划诊断（cfg.foresight_plan_eval，借鉴论文 §3.3.2 hit rate）：
+     以真实未来帧投影特征为 goal，GT (Δt,Δpose) 查询 vs batch 内其他样本的查询
+     （负样本），统计 GT 潜在距离最小的比例 hit@1 —— 直接回答「预测的特征对
+     基于动作条件的规划有没有用」，而非只看 cos_sim。仅 proj 模式、B≥2 有效。
 
 数据：全部日志中「8 帧连续前视图像」的窗口（不需要 4 相机/路线/标签）。
 
 用法：
     # 0) 数据准备（扫描 + 图像本地化；与旧 5 帧缓存不兼容，需重建）
     python -m my_drive.train.md_pretext prepare --num-windows 50000
-    # 1) PCA 目标矩阵预计算（foresight_target="pca" 时必需）
+    # 1) PCA 目标矩阵预计算（仅 foresight_target="pca" 时需要）
     python -m my_drive.train.md_pretext prepare-pca
-    # 2) 预训练（可选低分辨率课程：--image-size 320,192 → 再 --init-from 续训 640,384）
-    python -m my_drive.train.md_pretext train --epochs 10
+    # 2) 预训练（proj 模式：projector+SIGReg；可选 --rollout 开 rollout 一致性）
+    python -m my_drive.train.md_pretext train --epochs 10 --target proj \
+        --sigreg-weight 0.09 [--rollout]
     # 之后：md_train --stage 1 --init-from <pretext>/best_val.pt
+
+注意（proj 模式）：SIGReg 的 Epps–Pulley 统计在每个 micro-batch 内跨样本估计，
+有效 batch 太小时（B=2）统计噪声大 —— 建议 B 尽量大，或相应下调
+--sigreg-weight（论文在 batch=512 时用 λ=0.025，batch=128 时用 0.09）。
 """
 from __future__ import annotations
 import argparse
@@ -52,6 +71,7 @@ def prepare_pca(cfg: Config, cache_root: Path, out_path: Path,
     在冻结目标分支的第 3/6/9/12 层 concat 特征（1536 维）上，对训练窗口的目标帧
     随机采样 patch，累计一阶/二阶统计量后特征值分解，取前 pca_dim 个主成分。
     结果存 pca.pt：{"mean": (1536,), "components": (pca_dim,1536), ...}。
+    注意：仅 foresight_target="pca" 时需要；"proj" 模式用可学习 projector 替代。
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = _build_model_with_target(cfg, device)
@@ -102,45 +122,153 @@ def prepare_pca(cfg: Config, cache_root: Path, out_path: Path,
     return out_path
 
 
+# --------------------------------------------------------------------------- #
+# SIGReg（AD-E2E-JEPA Eq.10；检验统计量遵循 LeJEPA/SIGReg 默认配置）
+# --------------------------------------------------------------------------- #
+def _epps_pulley_stat(samples: torch.Tensor, knots: int = 17,
+                      t_max: float = 3.0) -> torch.Tensor:
+    """单变量 Epps–Pulley 正态性检验统计量（梯形积分近似）。
+
+    samples: (B, L, M) —— L 个 (时刻×patch) 位置 × M 个随机方向的 1 维投影，
+    B 为跨 batch 的样本数。返回 (L, M) 的 T = B·∫₀^t_max |ECF(t) − e^{−t²/2}|² dt。
+    """
+    B = samples.shape[0]
+    ts = torch.linspace(t_max / knots, t_max, knots,
+                        device=samples.device, dtype=torch.float32)  # (K,)，t=0 无信息略去
+    ang = samples.float().unsqueeze(-1) * ts                         # (B,L,M,K)
+    ecf_re = torch.cos(ang).mean(dim=0)                              # (L,M,K)
+    ecf_im = torch.sin(ang).mean(dim=0)
+    cf = torch.exp(-0.5 * ts * ts)                                   # N(0,1) 特征函数（实部）
+    err = (ecf_re - cf) ** 2 + ecf_im ** 2                           # (L,M,K)
+    w = torch.ones(knots, device=samples.device, dtype=torch.float32)
+    w[0] = w[-1] = 0.5                                               # 梯形权重
+    return B * (err * w).sum(dim=-1) * (t_max / knots)               # (L,M)
+
+
+def sigreg_loss(z: torch.Tensor, num_dirs: int, knots: int = 17) -> torch.Tensor:
+    """SIGReg（论文 Eq.10）：对每个 (时刻×patch) 位置，跨 batch 用 M 个随机方向
+    的 Epps–Pulley 检验把 D 维嵌入的 1 维投影拉向标准正态（Cramér–Wold：所有
+    1 维投影匹配 ⟺ 联合分布匹配各向同性高斯）；对位置与方向取均值。
+
+    z: (B, L, D)，L = 时刻×patch 数。随机方向每次调用重采样。
+    """
+    B, L, D = z.shape
+    dirs = torch.randn(D, num_dirs, device=z.device, dtype=torch.float32)
+    dirs = dirs / dirs.norm(dim=0, keepdim=True).clamp_min(1e-8)     # 单位球面方向
+    proj = z.float() @ dirs                                          # (B,L,M)
+    return _epps_pulley_stat(proj, knots).mean()
+
+
+@torch.no_grad()
+def _plan_hit_rate(model: MyDriveModel, predictor: ForesightPredictor,
+                   batch: Dict[str, torch.Tensor], cfg: Config,
+                   future_step: int) -> Optional[float]:
+    """val 规划诊断（借鉴论文 §3.3.2 hit rate 的轻量版，proj 模式专用）。
+
+    goal = 真实未来帧 f[3+k] 的投影特征；候选「动作」= 各样本的 GT (Δt,Δpose)
+    查询。对样本 i：分别用 GT 查询（正样本）与 batch 内其他样本的查询（负样本）
+    预测目标特征，若 GT 查询的潜在 L² 距离最小则记 hit。返回 hit@1（B<2 时 None）。
+
+    与论文的差别：论文用聚类轨迹词表做候选，这里用 batch 内真实驾驶动作做负样本，
+    无需构建词表即可给出「世界模型特征对规划是否有区分度」的在线信号。
+    """
+    B = batch["imgs"].shape[0]
+    if B < 2:
+        return None
+    k = int(future_step)
+    imgs = batch["imgs"]
+    _, patch_in = model._encode(imgs[:, :4], cams=[0, 0, 0, 0], need_patch=True)
+    z_hist = model._project_patches(patch_in)                        # (B,4,P',dp)
+    tgt_feat = model._foresight_target_patch(imgs[:, 3 + k])
+    z_goal = model.foresight_projector(tgt_feat, model.gh, model.gw)  # (B,P',dp)
+    costs = []                                                       # 候选 j → (B,)
+    for j in range(B):
+        dt_q = batch["dt8"][j, 3 + k: 4 + k].expand(B, 1)            # 候选 j 的查询条件
+        mo_q = batch["motion8"][j, 3 + k: 4 + k].expand(B, 1, 3)
+        pred = predictor(z_hist, batch["dt8"][:, :4], batch["motion8"][:, :4],
+                         dt_q, mo_q)                                 # (B,P',dp)
+        costs.append(((pred.float() - z_goal.float()) ** 2)
+                     .mean(dim=(1, 2)))                              # (B,)
+    C = torch.stack(costs, dim=1)                                    # (B,B)：C[i,j]
+    hit = (C.argmin(dim=1) == torch.arange(B, device=C.device)).float().mean()
+    return float(hit)
+
+
 def run_epoch(model, predictor, loader, cfg, device, optimizer=None,
               scheduler=None, limit_batches: int = 0,
               horizon: Optional[int] = None) -> Dict[str, float]:
     """一个 epoch 的训练或评估。
 
     训练（optimizer 非 None）：每 batch 随机采时距 k∈[1, foresight_max_step]，
-    返回 loss / cos_sim（所采时距上的值）。
+    返回 loss / cos_sim（所采时距上的值）；proj 模式额外返回
+    lpred / lsig（/ lroll，开 rollout 时）。
     评估（optimizer 为 None）：逐 batch 跑全部 k=1..max_step，返回
-    loss（各时距均值，早停准则）/ cos_sim（均值）及逐时距 loss_k1..kN / cos_k1..kN。
+    loss（各时距均值，早停准则）/ cos_sim（均值）及逐时距 loss_k1..kN / cos_k1..kN；
+    proj 模式且 cfg.foresight_plan_eval 时追加 hit@1 规划诊断。
     可用 horizon=k 固定时距（消融/复现旧单步行为用）。
     """
     training = optimizer is not None
     model.train(training)
     predictor.train(training)
+    proj_mode = cfg.foresight_target == "proj"
     k_max = horizon or cfg.foresight_max_step
     k_min = horizon or 1
     # bf16 无需 GradScaler（同 md_train）
     loss_sum, cos_sum, count, micro, t0 = 0.0, 0.0, 0, 0, time.time()
+    lp_sum, ls_sum, lr_sum, hit_sum, hit_n = 0.0, 0.0, 0.0, 0.0, 0
     per_k_loss: Dict[int, float] = {}
     per_k_cos: Dict[int, float] = {}
     per_k_n: Dict[int, int] = {}
     n_batches = min(limit_batches, len(loader)) if limit_batches else len(loader)
+
+    def _pred_loss(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """proj 模式用 MSE（论文 Eq.9，目标侧 sg 由调用处 detach 保证）；
+        pca/last 保持旧版 smooth_l1。"""
+        if proj_mode:
+            return F.mse_loss(pred.float(), tgt.detach().float())
+        return F.smooth_l1_loss(pred.float(), tgt.float(), beta=0.1)
+
+    def _fwd(k: int, batch_dev: Dict[str, torch.Tensor]):
+        with torch.autocast("cuda", dtype=torch.bfloat16,
+                            enabled=cfg.amp and device.type == "cuda"):
+            pred, tgt, aux = model.forward_foresight(batch_dev, predictor,
+                                                     future_step=k)
+            lp = _pred_loss(pred, tgt)
+            cos = F.cosine_similarity(pred.float(), tgt.detach().float(),
+                                      dim=-1).mean()
+            ls = pred.new_zeros((), dtype=torch.float32)
+            lroll = pred.new_zeros((), dtype=torch.float32)
+            if proj_mode:
+                z_pool = [aux["z_hist"].reshape(aux["z_hist"].shape[0], -1,
+                                                cfg.foresight_proj_dim),
+                          aux["z_tgt"]]
+                if training and cfg.foresight_rollout:
+                    # 自回归 rollout 一致性（论文 Eq.12/A.2.2，TBPTT）：
+                    # 首步已由上面的 teacher-forcing 项监督，rollout 项只取 j≥2
+                    rpreds, rtgts = model.forward_foresight_rollout(
+                        batch_dev, predictor, cfg.foresight_max_step)
+                    if len(rpreds) > 1:
+                        lroll = torch.stack([
+                            F.mse_loss(p.float(), t.detach().float())
+                            for p, t in zip(rpreds[1:], rtgts[1:])]).mean()
+                    z_pool.extend(rtgts)
+                if cfg.foresight_sigreg_weight > 0:
+                    ls = sigreg_loss(torch.cat(z_pool, dim=1),
+                                     cfg.foresight_sigreg_dirs,
+                                     cfg.foresight_sigreg_knots)
+            loss = lp + cfg.foresight_sigreg_weight * ls \
+                + cfg.foresight_rollout_weight * lroll
+        return loss, lp, ls, lroll, cos
+
     for i, batch in enumerate(loader):
         if limit_batches and i >= limit_batches:
             break
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-        def _fwd(k: int):
-            with torch.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=cfg.amp and device.type == "cuda"):
-                pred, tgt = model.forward_foresight(batch, predictor, future_step=k)
-                loss = F.smooth_l1_loss(pred.float(), tgt.float(), beta=0.1)
-                cos = F.cosine_similarity(pred.float(), tgt.float(), dim=-1).mean()
-            return loss, cos
-
         bs = batch["imgs"].shape[0]
         if training:
             k = int(torch.randint(k_min, k_max + 1, ()).item())   # 随机多步长
-            loss, cos = _fwd(k)
+            loss, lp, ls, lroll, cos = _fwd(k, batch)
             # 梯度累积：按本组实际微批数归一化（同 md_train）
             loss.backward()
             micro += 1
@@ -159,15 +287,30 @@ def run_epoch(model, predictor, loader, cfg, device, optimizer=None,
             count += bs
             loss_sum += float(loss) * bs
             cos_sum += float(cos) * bs
+            lp_sum += float(lp) * bs
+            ls_sum += float(ls) * bs
+            lr_sum += float(lroll) * bs
         else:
             with torch.no_grad():
                 for k in range(k_min, k_max + 1):                 # 逐时距评估
-                    loss, cos = _fwd(k)
+                    loss, lp, ls, lroll, cos = _fwd(k, batch)
                     per_k_loss[k] = per_k_loss.get(k, 0.0) + float(loss) * bs
                     per_k_cos[k] = per_k_cos.get(k, 0.0) + float(cos) * bs
                     per_k_n[k] = per_k_n.get(k, 0) + bs
+                    lp_sum += float(lp) * bs
+                    ls_sum += float(ls) * bs
+            if proj_mode and cfg.foresight_plan_eval:
+                hit = _plan_hit_rate(model, predictor, batch, cfg, k_max)
+                if hit is not None:
+                    hit_sum += hit * bs
+                    hit_n += bs
             count += bs
     out: Dict[str, float] = {"sec": time.time() - t0}
+    if proj_mode:
+        out["lpred"] = lp_sum / max(1, count)
+        out["lsig"] = ls_sum / max(1, count)
+        if training and cfg.foresight_rollout:
+            out["lroll"] = lr_sum / max(1, count)
     if training:
         out["loss"] = loss_sum / max(1, count)
         out["cos_sim"] = cos_sum / max(1, count)
@@ -178,6 +321,8 @@ def run_epoch(model, predictor, loader, cfg, device, optimizer=None,
         for k in ks:
             out[f"loss_k{k}"] = per_k_loss[k] / max(1, per_k_n[k])
             out[f"cos_k{k}"] = per_k_cos[k] / max(1, per_k_n[k])
+        if hit_n:
+            out["hit@1"] = hit_sum / hit_n
     return out
 
 
@@ -196,14 +341,15 @@ def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
                               persistent_workers=cfg.num_workers > 0, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=0, pin_memory=True)
+    proj_mode = cfg.foresight_target == "proj"
     model = _build_model_with_target(cfg, device)
     if cfg.foresight_target == "pca":
         model.load_foresight_pca(pca_path or (Path(cache_root) / "pca.pt"))
     predictor = ForesightPredictor(cfg).to(device)
     if init_from is not None:
         # 分辨率课程热启动：低分辨率 stage-0 checkpoint → 高分辨率续训。
-        # 模型无尺寸相关参数（predictor 对 token 序列操作、scene token 按相机数），
-        # 直接 strict=False 加载；缺失/多余键打印出来便于核查。
+        # 模型无尺寸相关参数（predictor 对 token 序列操作、projector 为全卷积、
+        # scene token 按相机数），直接 strict=False 加载；缺失/多余键打印出来便于核查。
         ckpt = torch.load(str(init_from), map_location="cpu", weights_only=True)
         m_missing, m_unexp = model.load_state_dict(ckpt["model"], strict=False)
         p_missing, p_unexp = predictor.load_state_dict(ckpt["predictor"], strict=False)
@@ -213,12 +359,16 @@ def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
         model.make_frozen_target_branch()          # init-from 后重建冻结目标分支
         if cfg.foresight_target == "pca" and not bool(model.foresight_pca_ready):
             model.load_foresight_pca(pca_path or (Path(cache_root) / "pca.pt"))
-    # 可训：LoRA 组（含 neck/scene_embeds）+ predictor；DINO 主干/planner/BEV 冻结
+    # 可训：LoRA 组（含 neck/scene_embeds）+ predictor；DINO 主干/planner/BEV 冻结；
+    # proj 模式再加 foresight projector（其余模式 projector 不前向，保持冻结）
     groups = model.param_groups()
-    for p in groups["dino"] + groups["planner"] + groups["bev"]:
+    for p in groups["dino"] + groups["planner"] + groups["bev"] + groups["foresight"]:
         p.requires_grad = False
     for p in groups["lora"]:
         p.requires_grad = True
+    if proj_mode:
+        for p in groups["foresight"]:
+            p.requires_grad = True
     params = [p for p in model.parameters() if p.requires_grad] + \
         list(predictor.parameters())
     n_train = sum(p.numel() for p in params) / 1e6
@@ -232,7 +382,10 @@ def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
     print(f"[stage 0] train {len(train_ds)} / val {len(val_ds)} 窗口 | "
           f"可训 {n_train:.2f}M | {steps_per_epoch} opt-steps/epoch | "
           f"target={cfg.foresight_target} spatial={cfg.foresight_spatial} "
-          f"max_step={horizon or cfg.foresight_max_step}", flush=True)
+          f"max_step={horizon or cfg.foresight_max_step}"
+          + (f" | proj_dim={cfg.foresight_proj_dim} "
+             f"λ_sig={cfg.foresight_sigreg_weight} M={cfg.foresight_sigreg_dirs} "
+             f"rollout={cfg.foresight_rollout}" if proj_mode else ""), flush=True)
     best_val, bad = float("inf"), 0
     history = []
     for epoch in range(epochs):
@@ -247,9 +400,15 @@ def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
         msg = (f"[s0 e{epoch:03d}] train_loss={tr['loss']:.4f} cos={tr['cos_sim']:.3f}"
                + (f" | val_loss={va['loss']:.4f} cos={va['cos_sim']:.3f}" if va else "")
                + f" ({tr['sec']:.0f}s)")
+        if proj_mode:
+            msg += f" | lpred={tr['lpred']:.4f} lsig={tr['lsig']:.4f}"
+            if "lroll" in tr:
+                msg += f" lroll={tr['lroll']:.4f}"
         if va and any(k.startswith("loss_k") for k in va):
             msg += " | " + " ".join(f"k{k[-1]}={va[k]:.4f}"
                                     for k in sorted(va) if k.startswith("loss_k"))
+        if va.get("hit@1") is not None:
+            msg += f" | hit@1={va['hit@1']:.3f}"
         print(msg, flush=True)
         if writer:
             for k, v in tr.items():
@@ -314,7 +473,18 @@ def main() -> None:
     p_tr.add_argument("--patience", type=int, default=3)
     p_tr.add_argument("--limit-batches", type=int, default=0)
     p_tr.add_argument("--pca", type=str, default="",
-                      help="PCA 矩阵路径（默认 <cache_root>/pca.pt）")
+                      help="PCA 矩阵路径（默认 <cache_root>/pca.pt；仅 pca 模式）")
+    p_tr.add_argument("--target", type=str, default="",
+                      choices=["", "pca", "last", "proj"],
+                      help="覆盖 cfg.foresight_target；proj=可学习 projector+SIGReg")
+    p_tr.add_argument("--sigreg-weight", type=float, default=-1.0,
+                      help="覆盖 cfg.foresight_sigreg_weight（λ；<0 用配置值）")
+    p_tr.add_argument("--sigreg-dirs", type=int, default=0,
+                      help="覆盖 cfg.foresight_sigreg_dirs（M；0 用配置值）")
+    p_tr.add_argument("--rollout", action="store_true",
+                      help="开自回归 rollout 一致性损失（仅 proj 模式，TBPTT）")
+    p_tr.add_argument("--no-plan-eval", action="store_true",
+                      help="关 val 的 hit@1 规划诊断（proj 模式默认开）")
     p_tr.add_argument("--init-from", type=str, default="",
                       help="低分辨率 stage-0 checkpoint，分辨率课程热启动用")
     p_tr.add_argument("--image-size", type=str, default="",
@@ -329,6 +499,18 @@ def main() -> None:
                  num_workers=getattr(args, "num_workers", 4))
     if getattr(args, "image_size", ""):
         cfg.image_size = _parse_size(args.image_size)
+    if getattr(args, "target", ""):
+        cfg.foresight_target = args.target
+    if getattr(args, "sigreg_weight", -1.0) >= 0:
+        cfg.foresight_sigreg_weight = args.sigreg_weight
+    if getattr(args, "sigreg_dirs", 0):
+        cfg.foresight_sigreg_dirs = args.sigreg_dirs
+    if getattr(args, "rollout", False):
+        cfg.foresight_rollout = True
+    if getattr(args, "no_plan_eval", False):
+        cfg.foresight_plan_eval = False
+    if cfg.foresight_rollout and cfg.foresight_target != "proj":
+        raise SystemExit("--rollout 仅在 --target proj 下可用")
     if args.cmd == "prepare":
         prepare_pretext_dataset(cfg, num_windows=args.num_windows,
                                 cache_root=Path(args.cache_root),
