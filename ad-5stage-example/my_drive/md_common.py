@@ -69,6 +69,29 @@ class Config:
     num_proposals: int = 64                           # 候选轨迹条数
     decoder_layers: int = 4                           # 逐层精修层数
     scorer_layers: int = 2                            # 质量 scorer 层数
+    # ---- 轨迹表征与监督（借鉴 TopoCurve, arXiv:2610.09118 / MGMP, arXiv:2610.10646） ----
+    # traj_repr="bezier"：planner 头输出 Bézier 控制点偏移（P0 固定 ego 原点，
+    # heading 由曲线切线解析给出），经 Bernstein 基矩阵投影回 8 个采样位姿——
+    # 离散点独立回归 → 结构约束曲线，数学保证光滑性。回归维度 24 → (n_ctrl-1)*2。
+    traj_repr: str = "bezier"                         # "bezier" / "raw"（旧行为，消融回退）
+    bezier_n_ctrl: int = 5                            # 控制点数（含固定起点；4=TopoCurve 同款三次曲线）
+    # top-k 监督（CARS 思想）：每层不再只回传离 GT 最近的 1 条（WTA），
+    # 而是 top-k 条按衰减权重加权——缓解 64 选 1 的监督稀疏，给 scorer 更密的信号。
+    w_traj_topk: int = 5                              # 1 = 旧 WTA 行为
+    topk_weight_decay: float = 0.5                    # 第 j 名权重 ∝ decay^(j-1)，归一化
+    # 推理/评估时几何重打分（MGMP 思想：学习先验提议、显式几何裁决）：
+    # 对 scorer top-m 的 proposal，用预测 BEV 地图（车道合规）+ 预测检测热力图
+    # （碰撞代理）+ 进度做显式校验重选，替代裸 argmax。仅 not training 且
+    # with_planner & with_bev 时生效（stage 3 / 最终推理），训练损失不受影响。
+    geo_rescore: bool = True
+    geo_rescore_m: int = 8                            # 进入几何校验的候选数
+    # 权重标定原则：几何项要能在 scorer 过度自信时仍然翻盘（安全壳的意义），
+    # 故碰撞与车道权重显著大于 scorer 分（top-m 内 softmax 值域 [0,1]）
+    w_g_scorer: float = 0.5                           # 学习 scorer 分（top-m 内 softmax）权重
+    w_g_lane: float = 1.5                             # 可行驶区合规权重（预测地图 soft 概率）
+    w_g_col: float = 3.0                              # 碰撞代理惩罚（预测热力图，8 步取 max）
+    w_g_oob: float = 1.0                              # 越界惩罚：任一步 footprint 出图比例的最大值（未知≠安全）
+    w_g_prog: float = 0.3                             # 前向进度权重
     # ---- 损失权重 ----
     w_traj: float = 1.0
     w_bev_map: float = 1.0

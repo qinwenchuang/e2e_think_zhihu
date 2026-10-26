@@ -178,6 +178,28 @@ def sinusoidal_dt(dt_seconds: torch.Tensor, dim: int, scale: float = 1.0) -> tor
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)  # (...,256)
 
 
+def _bernstein_matrices(n_ctrl: int, K: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Bézier Bernstein 基矩阵 A (K,n_ctrl) 与导数基 A′ (K,n_ctrl)。
+
+    采样点 t_k = (k+1)/K（k=0..K-1）：轨迹定义为 ego 当前时刻之后的 K 个未来位姿，
+    故 t 从 1/K 起（t=0 即 ego 原点，不占监督位），终点 t=1 对应最后一步。
+    A′ 是 A 对 t 的解析导数（B′(t) = d·Σ b_{d-1,j}(t)·(P_{j+1}−P_j)），
+    用于从控制点直接求各采样点的切线方向 → heading，无需有限差分。
+    """
+    from math import comb
+    d = n_ctrl - 1
+    t = (np.arange(K, dtype=np.float64) + 1.0) / K
+    A = np.zeros((K, n_ctrl), dtype=np.float64)
+    for j in range(n_ctrl):
+        A[:, j] = comb(d, j) * (1.0 - t) ** (d - j) * t ** j
+    Ad = np.zeros((K, n_ctrl), dtype=np.float64)
+    for j in range(d):
+        b = comb(d - 1, j) * (1.0 - t) ** (d - 1 - j) * t ** j
+        Ad[:, j] -= d * b
+        Ad[:, j + 1] += d * b
+    return A.astype(np.float32), Ad.astype(np.float32)
+
+
 class PatchProjector(nn.Module):
     """可学习 patch projector（AD-E2E-JEPA 核心组件，arXiv:2609.34085 Fig.2 a.1）。
 
@@ -256,8 +278,17 @@ class ProposalPlanner(nn.Module):
       init_head                   → 初始 proposals
       decoder（L 层，深监督）     → 每层精修一次 proposals
       pos_embed + scorer blocks   → 每条 proposal 的质量 logit（嵌入用 detach）
-      argmax(quality)             → 最终轨迹
-    监督策略（见 md_loss）：WTA（每层只监督离 GT 最近的那条）+ 质量分数回归负 ADE。
+      argmax(quality)             → 最终轨迹（推理时可选几何重打分覆盖，见 geo_rescore）
+    监督策略（见 md_loss）：top-k 加权 L1（k=1 时退化为 WTA）+ 质量分数回归负 ADE。
+
+    轨迹表征（cfg.traj_repr，借鉴 TopoCurve arXiv:2610.09118 §3.3）：
+      "bezier"：头输出 Bézier 控制点偏移 (n_ctrl-1)×2，P0 固定 ego 原点
+      （规划场景起点已知，比论文更有利）；经 Bernstein 基投影回 8 个采样位姿，
+      heading 由曲线切线解析给出（atan2 导数基），不再逐点独立回归。
+      保证轨迹光滑、切线连续，曲率可解析求取；回归维度 24 → (n_ctrl-1)·2。
+      "raw"：逐点回归 8×3（旧行为，消融回退）。
+    注意：切换 traj_repr 会改变 head 输出维度，旧 checkpoint 的 planner 头键
+    形状不匹配会被 check_ckpt_compat 拒绝；换表征请从干净 ckpt 重训 stage1。
     """
 
     def __init__(self, cfg: Config):
@@ -265,22 +296,63 @@ class ProposalPlanner(nn.Module):
         self.cfg = cfg
         d = cfg.d_model                                # 256
         N = cfg.num_proposals                          # 64
-        out_dim = NUM_FUTURE_POSES * 3                 # 24 = 8 步 × (x,y,heading)
+        self.K = NUM_FUTURE_POSES                      # 8 个未来位姿
+        self.bezier = cfg.traj_repr == "bezier"
+        if self.bezier:
+            self.n_ctrl = cfg.bezier_n_ctrl
+            # 头输出维度：控制点 1..n_ctrl-1 的 xy（P0 固定原点不回归）
+            head_dim = (self.n_ctrl - 1) * 2
+            A, Ad = _bernstein_matrices(self.n_ctrl, self.K)
+            # buffer 随 checkpoint 保存/.to() 迁移；旧 ckpt 无此键 → check_ckpt_compat 拒绝
+            self.register_buffer("bern", torch.from_numpy(A))        # (K, n_ctrl)
+            self.register_buffer("bern_dot", torch.from_numpy(Ad))   # (K, n_ctrl)
+        else:
+            head_dim = self.K * 3                      # 24 = 8 步 × (x,y,heading)
+        self.head_dim = head_dim
+        out_dim = self.K * 3                           # scorer pos_embed 恒用 24 维位姿
         self.proposal_embed = nn.Embedding(N, d)
         self.ego_mlp = nn.Sequential(nn.Linear(8, d), nn.GELU(), nn.Linear(d, d))
         self.dt_embed = nn.Linear(d, d)
-        self.ego_motion_mlp = nn.Sequential(nn.Linear(3, d), nn.GELU(), nn.Linear(d, d))
-        self.init_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, out_dim))
+        self.ego_motion_mlp = nn.Sequential(nn.Linear(3, d), nn.GELU(),
+                                            nn.Linear(d, d))
+        self.init_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, head_dim))
         self.decoder = nn.ModuleList([
             _DecoderBlock(d, cfg.planner_heads, d * 2) for _ in range(cfg.decoder_layers)])
         self.refine_heads = nn.ModuleList([
-            nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, out_dim))
+            nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, head_dim))
             for _ in range(cfg.decoder_layers)])
         self.pos_embed = nn.Sequential(nn.Linear(out_dim, d * 2), nn.ReLU(),
                                        nn.Linear(d * 2, d))
         self.scorer = nn.ModuleList([
             _DecoderBlock(d, cfg.planner_heads, d * 2) for _ in range(cfg.scorer_layers)])
         self.quality_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+
+    def _ctrl_to_waypoints(self, ctrl_delta: torch.Tensor
+                           ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Bézier 控制点偏移 (B,N,n_ctrl-1,2) → (采样位姿 (B,N,K,3), 切线 (B,N,K,2))。
+
+        P0 固定 (0,0)（ego 原点）；waypoint xy = A·C（Bernstein 基投影，与 loss /
+        评估在同一投影空间比较，对应 TopoCurve 的 "matching in projected space"）；
+        heading = 解析切线方向 atan2(B′(t))（切向近零时 yaw 无定义但 atan2 安全；
+        监督侧用切线余弦项规避 atan2 奇点，见 md_loss）。切线同时返回给损失函数
+        做光滑的航向监督。
+        """
+        B, N = ctrl_delta.shape[:2]
+        zeros = ctrl_delta.new_zeros(B, N, 1, 2)
+        ctrl = torch.cat([zeros, ctrl_delta], dim=2)   # (B,N,n_ctrl,2)
+        xy = torch.einsum("kc,bncd->bnkd", self.bern, ctrl)
+        tan = torch.einsum("kc,bncd->bnkd", self.bern_dot, ctrl)
+        yaw = torch.atan2(tan[..., 1], tan[..., 0])    # (B,N,K)
+        return torch.cat([xy, yaw[..., None]], dim=-1), tan
+
+    def _head_to_waypoints(self, raw: torch.Tensor
+                           ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """头输出 (B,N,head_dim) → ((B,N,K,3), 切线|None)（两种表征统一出口）。"""
+        if self.bezier:
+            return self._ctrl_to_waypoints(
+                raw.reshape(*raw.shape[:2], self.n_ctrl - 1, 2))
+        return raw.reshape(*raw.shape[:2], self.K, 3), None
+
     def build_context(self, r_all: torch.Tensor, queue: torch.Tensor,
                       ego_status: torch.Tensor, ego_motion: torch.Tensor,
                       frame_dt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -327,11 +399,19 @@ class ProposalPlanner(nn.Module):
         ctx, ego_token = self.build_context(r_all, queue, ego_status, ego_motion, frame_dt)
         # 初始 proposal tokens：learned embed + ego
         tokens = self.proposal_embed.weight[None] + ego_token        # (B,N,d)
-        proposal_list = [self.init_head(tokens).reshape(B, N, NUM_FUTURE_POSES, 3)]
+        proposal_list: List[torch.Tensor] = []
+        tangent_list: List[torch.Tensor] = []          # 仅 bezier 模式非空（供损失用）
+        wp, tan = self._head_to_waypoints(self.init_head(tokens))
+        proposal_list.append(wp)
+        if tan is not None:
+            tangent_list.append(tan)
         # 逐层精修：tokens 过 decoder，每层回归一次 proposals（深监督）
         for block, head in zip(self.decoder, self.refine_heads):
             tokens = block(tokens, ctx)                              # (B,N,d)
-            proposal_list.append(head(tokens).reshape(B, N, NUM_FUTURE_POSES, 3))
+            wp, tan = self._head_to_waypoints(head(tokens))
+            proposal_list.append(wp)
+            if tan is not None:
+                tangent_list.append(tan)
         final_props = proposal_list[-1]                              # (B,N,8,3)
         # scorer：proposal 嵌入（detach，scorer 梯度不回流生成器）→ 质量 logit
         embedded = self.pos_embed(final_props.detach().reshape(B, N, -1))  # (B,N,d)
@@ -341,8 +421,11 @@ class ProposalPlanner(nn.Module):
         # argmax 质量 logit 选轨迹
         sel = scores.argmax(dim=1)                                   # (B,)
         trajectory = final_props[torch.arange(B, device=scores.device), sel]  # (B,8,3)
-        return {"trajectory": trajectory, "proposal_list": proposal_list,
-                "proposal_scores": scores}
+        out = {"trajectory": trajectory, "proposal_list": proposal_list,
+               "proposal_scores": scores}
+        if tangent_list:
+            out["tangent_list"] = tangent_list
+        return out
 
 
 class SpatialCrossAttention(nn.Module):
@@ -629,6 +712,126 @@ class ForesightPredictor(nn.Module):
         return self.pred(self.out_norm(x[:, -1]))                # (B,P,out_dim)
 
 
+def _grid_norm(xy: torch.Tensor, cfg: Config, ps: float,
+               Hm: float, Wm: float) -> torch.Tensor:
+    """ego 坐标 (...,2) → grid_sample 归一化网格 (...,2)（align_corners=False）。
+
+    栅格约定（全链路统一）：行 = 前向 x、列 = 横向 y。grid_sample 的
+    grid[..., 0] 对应 W 维（列 → y），grid[..., 1] 对应 H 维（行 → x）。
+    align_corners=False 下，连续像素坐标 u=(xy-min)/ps 已含 cell 中心 0.5
+    （像素 c 的中心 u=c+0.5），归一化 (u/W)*2-1 直接对齐，不能再加 +0.5；
+    多加 0.5 会整体偏移半个像素（0.5m 网格上约 0.25m）。
+    """
+    gx = ((xy[..., 1] - cfg.pc_y_min) / ps) / Wm * 2 - 1         # y → W
+    gy = ((xy[..., 0] - cfg.pc_x_min) / ps) / Hm * 2 - 1         # x → H
+    return torch.stack([gx, gy], dim=-1)
+
+
+def _bev_sample_grid(xy: torch.Tensor, cfg: Config) -> torch.Tensor:
+    """BEV 语义地图栅格（bev_map_size @ bev_pixel_size/bev_map_stride）。"""
+    return _grid_norm(xy, cfg, cfg.bev_pixel_size / cfg.bev_map_stride,
+                      *cfg.bev_map_size)
+
+
+def _det_sample_grid(xy: torch.Tensor, cfg: Config) -> torch.Tensor:
+    """检测热力图栅格（det_map_size @ det_pixel_size，与 BEV 地图栅格解耦）。"""
+    return _grid_norm(xy, cfg, cfg.det_pixel_size, *cfg.det_map_size)
+
+
+@torch.no_grad()
+def geo_rescore_selection(out: Dict[str, torch.Tensor], cfg: Config
+                          ) -> Dict[str, torch.Tensor]:
+    """推理时几何重打分（MGMP arXiv:2610.10646 思想：学习先验提议、显式几何裁决）。
+
+    现状：最终轨迹 = argmax(学习 scorer)。scorer 可能选中在预测 BEV 上明明
+    压线/撞障碍的 proposal（学习分与几何约束之间存在鸿沟）。本函数对 scorer
+    top-m 的候选做显式校验并重选：
+
+      geo = (w_s·softmax_m(scorer) + w_lane·车道合规 − w_col·碰撞代理
+             − w_oob·越界 + w_prog·进度)
+
+      * 车道合规：waypoint 处 map_logits softmax 的（lane+roadblock）概率均值
+        （软代价——地图是网络预测有噪声，不做硬约束，与 MGMP 的精确几何不同）；
+      * 碰撞代理：ego footprint（后轴中心 + 四角，含 col_margin 膨胀）处
+        sigmoid(det_heatmap) 各类最大值，取 8 步 × 5 点的 max
+        （单点高置信命中即否决该候选，MGMP 的硬碰撞 veto 的软版本；
+        预测热力图是静态快照、不含未来运动，故仍是加权项而非严格门控）；
+      * 越界：任一步 footprint 采样点落在栅格外的比例（按步取 max）；未知区域
+        不再按“无碰撞/可行驶”处理，由 w_g_oob 单独惩罚（避免把未知区域当安全区）；
+      * scorer 分：在 top-m 候选内做 softmax（相对偏好，量纲与其余项可比；
+        若对全 64 条 softmax，峰值分布会独吞 ~1.0 压垮几何项）；
+      * 进度：末端前向位移限幅 20m。
+
+    全部经 grid_sample 双线性采样，可微、纯张量、无逐样本循环。
+    训练时不调用（训练损失直接作用于 proposal_list / scores）。
+
+    :param out: model.forward 的输出（需含 proposal_list / proposal_scores /
+        map_logits / det_heatmap）
+    :return: 原地更新并返回 out：覆盖 "trajectory"，新增 "geo_sel"（选中下标）、
+        "geo_scores"（top-m 几何分）、"geo_oob"（top-m 越界比例）
+    """
+    props = out["proposal_list"][-1].float()           # (B,N,K,3)
+    scores = out["proposal_scores"].float()            # (B,N)
+    B, N, K = props.shape[:3]
+    m = min(cfg.geo_rescore_m, N)
+    top = scores.topk(m, dim=1).indices                # (B,m)
+    cand = props.gather(1, top[:, :, None, None].expand(-1, -1, K, 3))  # (B,m,K,3)
+    xy = cand[..., :2]
+    grid = _bev_sample_grid(xy, cfg)[:, :, :, None, :]                 # BEV 地图栅格
+    # 车道合规：预测地图 drivable 类（1=lane、2=roadblock）soft 概率；
+    # 出图 waypoint 不计入（其概率由 padding=0 得到，会系统性低估）
+    p_map = torch.softmax(out["map_logits"].float(), dim=1)
+    drivable = (p_map[:, 1] + p_map[:, 2])[:, None]                    # (B,1,H,W)
+    lane = F.grid_sample(drivable.expand(B, m, -1, -1).reshape(B * m, 1, *drivable.shape[-2:]),
+                         grid.reshape(B * m, K, 1, 2),
+                         mode="bilinear", padding_mode="zeros",
+                         align_corners=False).reshape(B, m, K)         # (B,m,K)
+    valid_lane = ((grid[..., 0].abs() <= 1.0) & (grid[..., 1].abs() <= 1.0)).squeeze(-1)
+    # 出图 waypoint 从 lane 均值中剔除（其 padding=0 概率会低估）；只保留
+    # 落到地图内的 waypoint 求比例，避免“分母恒 8、分子先乘 0”导致偏低。
+    # 全部出图时 lane=0，由下方 oob 单独严惩，避免同一越界被重复扣分。
+    valid_f = valid_lane.float()
+    lane = (lane * valid_f).sum(-1) / valid_f.sum(-1).clamp_min(1.0)  # (B,m)
+
+    # 碰撞代理：ego footprint（后轴中心 + 四角，含 col_margin 膨胀）采样，
+    # 8 步 × 5 点取 max——4.9m×2.3m 的车不是一个点，只采样中心会漏掉路沿/障碍。
+    yaw = cand[..., 2]                                                # (B,m,K)
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    hl = 0.5 * (cfg.ego_len + 2.0 * cfg.col_margin)
+    hw = 0.5 * (cfg.ego_wid + 2.0 * cfg.col_margin)
+    ox = torch.tensor([hl, hl, -hl, -hl, 0.0], device=props.device, dtype=props.dtype)
+    oy = torch.tensor([hw, -hw, hw, -hw, 0.0], device=props.device, dtype=props.dtype)
+    dx = ox[None, None, None, :] * c[..., None] - oy[None, None, None, :] * s[..., None]
+    dy = ox[None, None, None, :] * s[..., None] + oy[None, None, None, :] * c[..., None]
+    foot_xy = torch.stack([cand[..., 0, None] + dx, cand[..., 1, None] + dy], dim=-1)  # (B,m,K,P,2)
+    grid_foot = _det_sample_grid(foot_xy, cfg)                        # (B,m,K,P,2)
+    valid_foot = ((grid_foot[..., 0].abs() <= 1.0)
+                  & (grid_foot[..., 1].abs() <= 1.0))                 # (B,m,K,P)
+    heat = torch.sigmoid(out["det_heatmap"].float()).amax(dim=1, keepdim=True)  # (B,1,H,W)
+    col_vals = F.grid_sample(heat.expand(B, m, -1, -1).reshape(B * m, 1, *heat.shape[-2:]),
+                             grid_foot.reshape(B * m, K * 5, 1, 2),
+                             mode="bilinear", padding_mode="zeros",
+                             align_corners=False).reshape(B, m, K, 5)
+    col_vals = torch.where(valid_foot, col_vals, torch.zeros_like(col_vals))
+    col = col_vals.amax(dim=-1).amax(dim=-1)                          # (B,m)
+    # 未知区域（出图）不再按“无碰撞”处理：取“任一步 footprint 出图比例”的最大值，
+    # 避免只有末端一步越界时被 8 步平均稀释。
+    oob = (1.0 - valid_foot.float().mean(dim=-1)).amax(dim=-1)        # (B,m)
+
+    prog = (cand[:, :, -1, 0] / 20.0).clamp(0.0, 1.0)                  # (B,m)
+    s_prob = torch.softmax(scores.gather(1, top), dim=-1)              # top-m 内 softmax
+    geo = (cfg.w_g_scorer * s_prob + cfg.w_g_lane * lane
+           - cfg.w_g_col * col - cfg.w_g_oob * oob
+           + cfg.w_g_prog * prog)                                     # (B,m)
+    sel_m = geo.argmax(dim=1)                                          # (B,)
+    sel = top.gather(1, sel_m[:, None]).squeeze(1)                     # 原 N 维下标
+    out["trajectory"] = props[torch.arange(B, device=props.device), sel]
+    out["geo_sel"] = sel
+    out["geo_scores"] = geo
+    out["geo_oob"] = oob
+    return out
+
+
 class MyDriveModel(nn.Module):
     """DINOv3+LoRA 多帧编码 + 时序 planner + lite BEV 头。
 
@@ -709,6 +912,10 @@ class MyDriveModel(nn.Module):
                 r_all, queue, batch["ego_status"], batch["ego_motion"], batch["frame_dt"]))
         if with_bev:
             out.update(self.bev_head(patch_cur, batch["cam_K"], batch["cam_ego2cam"]))
+        # 推理/评估时的几何重打分（MGMP）：学习 scorer 提议 top-m，显式几何裁决。
+        # 训练态跳过——训练损失直接作用于 proposal_list / scores，重选不影响梯度。
+        if (with_planner and with_bev and self.cfg.geo_rescore and not self.training):
+            out = geo_rescore_selection(out, self.cfg)
         return out
 
     def make_frozen_target_branch(self) -> None:

@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from ..md_common import WORK_ROOT, Config
+from ..md_common import WORK_ROOT, Config, normalize_angle
 from ..data.md_data import OverfitDataset
 from .md_model import MyDriveModel
 
@@ -44,7 +44,7 @@ def _footprint_corners(x, y, yaw, l, w) -> np.ndarray:
 
 
 def _poly_to_grid(corners: np.ndarray, cfg: Config) -> np.ndarray:
-    """(N,2) ego 坐标多边形 → (100,100)@0.5m 的 0/1 栅格掩码（行=x、列=y）。"""
+    """(N,2) ego 坐标多边形 → cfg.bev_map_size 的 0/1 栅格掩码（行=x、列=y）。"""
     ps = cfg.bev_pixel_size / cfg.bev_map_stride
     col = (corners[:, 1] - cfg.pc_y_min) / ps
     row = (corners[:, 0] - cfg.pc_x_min) / ps
@@ -55,7 +55,7 @@ def _poly_to_grid(corners: np.ndarray, cfg: Config) -> np.ndarray:
 
 
 def _boxes_occupancy(boxes: np.ndarray, valid: np.ndarray, cfg: Config) -> np.ndarray:
-    """(M,7)+(M,) → (100,100) 障碍物占用图。"""
+    """(M,7)+(M,) → cfg.bev_map_size 障碍物占用图。"""
     occ = np.zeros(cfg.bev_map_size, dtype=np.uint8)
     for box, v in zip(boxes, valid):
         if not v:
@@ -73,7 +73,7 @@ def compute_rewards(sampled: np.ndarray, future_boxes: np.ndarray,
     """逐条采样轨迹的规则奖励（numpy，全部在 ego 系）。
 
     :param sampled: (B,k,8,3) 采样轨迹；future_boxes (B,8,M,7) 各时间步障碍物真值；
-        bev_map (B,100,100) 地图标签；traj_gt (B,8,3)
+        bev_map (B,H,W) 地图标签（cfg.bev_map_size）；traj_gt (B,8,3)
     :return: (B,k) 奖励矩阵
     """
     B, k = sampled.shape[:2]
@@ -100,7 +100,8 @@ def compute_rewards(sampled: np.ndarray, future_boxes: np.ndarray,
             ps = cfg.bev_pixel_size / cfg.bev_map_stride
             rows = ((traj[:, 0] - cfg.pc_x_min) / ps).astype(np.int64)
             cols = ((traj[:, 1] - cfg.pc_y_min) / ps).astype(np.int64)
-            in_grid = (rows >= 0) & (rows < 100) & (cols >= 0) & (cols < 100)
+            hm, wm = cfg.bev_map_size
+            in_grid = (rows >= 0) & (rows < hm) & (cols >= 0) & (cols < wm)
             drivable = np.zeros(8, dtype=bool)
             for s in range(8):
                 if in_grid[s]:
@@ -108,8 +109,10 @@ def compute_rewards(sampled: np.ndarray, future_boxes: np.ndarray,
             r_lane = drivable.mean()
             # ---- 进度：末端前向位移（限幅 20m；倒退得 0） ----
             r_prog = float(np.clip(traj[-1, 0] / 20.0, 0.0, 1.0))
-            # ---- 舒适：yaw 二阶差（jerk 代理） ----
-            ddy = np.abs(np.diff(traj[:, 2], n=2))
+            # ---- 舒适：yaw 二阶差（jerk 代理）；先逐差归一化到 [-π,π)，
+            # 避免跨 ±π 的掉头/近零切线产生 ~2π 伪 jerk ----
+            dth = normalize_angle(np.diff(traj[:, 2]))
+            ddy = np.abs(normalize_angle(np.diff(dth)))
             r_comf = float(np.exp(-ddy.mean()))              # ∈ (0,1]
             # ---- GT 锚定（小权重防 reward hacking） ----
             ade = float(np.linalg.norm(traj[:, :2] - traj_gt[b, :, :2], axis=-1).mean())
@@ -133,15 +136,20 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
                               persistent_workers=cfg.num_workers > 0, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=0, pin_memory=True)
+    from .md_train import check_ckpt_compat
     model = MyDriveModel(cfg).to(device)
     ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
     # 形状匹配的键才载入（同 md_train 的初始化策略）
     own = model.state_dict()
     compatible = {kk: vv for kk, vv in ckpt["model"].items()
                   if kk in own and own[kk].shape == vv.shape}
+    skipped = [kk for kk in ckpt["model"] if kk not in compatible]
+    missing = [kk for kk in own if kk not in compatible]
+    check_ckpt_compat(ckpt, cfg, skipped, source=str(init_from),
+                      missing=missing, own_keys=list(own))
     model.load_state_dict(compatible, strict=False)
     print(f"载入 SFT {init_from}（stage {ckpt.get('stage')} epoch {ckpt.get('epoch')}）"
-          f" 匹配 {len(compatible)} 键")
+          f" 匹配 {len(compatible)} 键，跳过 {len(skipped)} 个不匹配键")
     # 只训 scorer（pos_embed / scorer / quality_head），其余全部冻结
     scorer_prefixes = ("planner.pos_embed.", "planner.scorer.", "planner.quality_head.")
     for n, p in model.named_parameters():
@@ -150,12 +158,16 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
     ref_planner = copy.deepcopy(model.planner)
     for p in ref_planner.parameters():
         p.requires_grad = False
-    model.eval()
+    # 与 stage1 SFT 一致：训练时保持 train 模式（scorer/quality_head 的 dropout
+    # 参与更新）；验证函数内部临时切 eval，结束后恢复。
+    model.train()
     ref_planner.eval()
     params = [p for p in model.parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in params) / 1e6
     optimizer = torch.optim.AdamW(params, lr=cfg.grpo_lr, weight_decay=0.01)
-    steps_per_epoch = math.ceil(len(train_loader) / cfg.grad_accum)
+    grad_accum = max(1, cfg.grad_accum)
+    n_batches = min(limit_batches, len(train_loader)) if limit_batches else len(train_loader)
+    steps_per_epoch = math.ceil(n_batches / grad_accum)
     from .md_train import WarmupCosine
     scheduler = WarmupCosine(optimizer, steps_per_epoch * epochs,
                              max(1, int(steps_per_epoch * epochs * 0.1)), cfg.grpo_lr)
@@ -184,7 +196,7 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
     for epoch in range(epochs):
         t0 = time.time()
         loss_sum, rew_sum, count = 0.0, 0.0, 0
-        n_batches = min(limit_batches, len(train_loader)) if limit_batches else len(train_loader)
+        micro = 0
         for i, batch in enumerate(train_loader):
             if limit_batches and i >= limit_batches:
                 break
@@ -211,10 +223,18 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
             kl = (pi * (torch.log(pi + 1e-8) - torch.log(pi_ref + 1e-8))).sum(-1).mean()
             loss = -(adv * logp).mean() + cfg.grpo_beta * kl
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            micro += 1
+            # 梯度累积：与 md_train 一致，loss 不预除；更新时按本组实际微批数归一化
+            if (i + 1) % grad_accum == 0 or (i + 1) == n_batches:
+                if micro > 1:
+                    for p in params:
+                        if p.grad is not None:
+                            p.grad.div_(micro)
+                micro = 0
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
             loss_sum += float(loss.detach()) * batch["traj"].shape[0]
             rew_sum += float(r_t.mean()) * batch["traj"].shape[0]
             count += batch["traj"].shape[0]
@@ -246,7 +266,13 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
     return out_dir / "best.pt"
 @torch.no_grad()
 def evaluate_selection(model, ref_planner, val_loader, cfg, device) -> Dict[str, float]:
-    """验证：π（GRPO）与 π_ref（SFT）各自 argmax 选择的轨迹的规则奖励指标对比。"""
+    """验证：π（GRPO）与 π_ref（SFT）各自 argmax 选择的轨迹的规则奖励指标对比。
+
+    训练循环里 model 保持 train 模式（与 stage1 SFT 一致，含 scorer dropout）；
+    这里临时切 eval 保证指标可复现，结束后恢复原模式。
+    """
+    was_training = model.training
+    model.eval()
     sums = {"mean_reward": 0.0, "sft_reward": 0.0, "col_rate": 0.0, "sft_col_rate": 0.0,
             "lane_rate": 0.0, "sft_lane_rate": 0.0, "prog": 0.0, "sft_prog": 0.0,
             "ade": 0.0, "sft_ade": 0.0}
@@ -291,6 +317,7 @@ def evaluate_selection(model, ref_planner, val_loader, cfg, device) -> Dict[str,
             sums["ade"] += d_pi["ade"]
             sums["sft_ade"] += d_sft["ade"]
             n += 1
+    model.train(was_training)
     return {k: v / n for k, v in sums.items()}
 def _decompose(traj, fb, fv, bm, gt, cfg, ego_len, ego_wid, margin) -> Dict[str, float]:
     """单条轨迹的奖励拆项（碰撞率/车道率/进度/ADE，用于验证指标）。"""
@@ -306,7 +333,8 @@ def _decompose(traj, fb, fv, bm, gt, cfg, ego_len, ego_wid, margin) -> Dict[str,
     ps = cfg.bev_pixel_size / cfg.bev_map_stride
     rows = ((tr[:, 0] - cfg.pc_x_min) / ps).astype(np.int64)
     cols = ((tr[:, 1] - cfg.pc_y_min) / ps).astype(np.int64)
-    ok = (rows >= 0) & (rows < 100) & (cols >= 0) & (cols < 100)
+    hm, wm = cfg.bev_map_size
+    ok = (rows >= 0) & (rows < hm) & (cols >= 0) & (cols < wm)
     lane = sum(bm[0, rows[s], cols[s]] in DRIVABLE_CLASSES for s in range(8)
                if ok[s]) / 8.0
     prog = float(np.clip(tr[-1, 0] / 20.0, 0.0, 1.0))
@@ -315,17 +343,21 @@ def _decompose(traj, fb, fv, bm, gt, cfg, ego_len, ego_wid, margin) -> Dict[str,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--init-from", type=str, required=True, help="SFT 检查点（stage1 best_val）")
-    ap.add_argument("--cache-root", type=str, default=str(WORK_ROOT / "cache_13k"))
-    ap.add_argument("--out-dir", type=str, default=str(WORK_ROOT / "runs_v5" / "grpo"))
+    ap.add_argument("--cache-root", type=str, default=str(WORK_ROOT / "cache"))
+    ap.add_argument("--out-dir", type=str, default=str(WORK_ROOT / "runs" / "grpo"))
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--limit-batches", type=int, default=0)
     ap.add_argument("--no-tb", action="store_true")
+    # 表征参数必须与 SFT（stage 1）训练时一致，否则 planner 结构不匹配
+    ap.add_argument("--traj-repr", type=str, default="bezier", choices=["bezier", "raw"])
+    ap.add_argument("--bezier-ctrl", type=int, default=5)
     args = ap.parse_args()
     cfg = Config(batch_size=args.batch_size, grad_accum=args.grad_accum,
-                 num_workers=args.num_workers)
+                 num_workers=args.num_workers, traj_repr=args.traj_repr,
+                 bezier_n_ctrl=args.bezier_ctrl)
     train_grpo(cfg, Path(args.init_from), Path(args.cache_root), Path(args.out_dir),
                epochs=args.epochs, limit_batches=args.limit_batches, tb=not args.no_tb)
 if __name__ == "__main__":

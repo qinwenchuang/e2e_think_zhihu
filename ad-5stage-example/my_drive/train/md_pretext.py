@@ -307,8 +307,13 @@ def run_epoch(model, predictor, loader, cfg, device, optimizer=None,
             count += bs
     out: Dict[str, float] = {"sec": time.time() - t0}
     if proj_mode:
-        out["lpred"] = lp_sum / max(1, count)
-        out["lsig"] = ls_sum / max(1, count)
+        # eval 分支在 k_min..k_max 循环里各累加一次 lp/ls，count 却每 batch 只加 1；
+        # 分母补上时距数，否则 eval 的 lpred/lsig 会被放大 n_k 倍（早停只看 loss，
+        # 但日志/调参会误读）。
+        n_k = k_max - k_min + 1
+        denom = count if training else count * n_k
+        out["lpred"] = lp_sum / max(1, denom)
+        out["lsig"] = ls_sum / max(1, denom)
         if training and cfg.foresight_rollout:
             out["lroll"] = lr_sum / max(1, count)
     if training:
@@ -465,7 +470,7 @@ def main() -> None:
     p_tr = sub.add_parser("train")
     p_tr.add_argument("--epochs", type=int, default=10)
     p_tr.add_argument("--cache-root", type=str, default=str(WORK_ROOT / "cache_pretext"))
-    p_tr.add_argument("--out-dir", type=str, default=str(WORK_ROOT / "runs_13k" / "stage0"))
+    p_tr.add_argument("--out-dir", type=str, default=str(WORK_ROOT / "runs" / "stage0"))
     p_tr.add_argument("--batch-size", type=int, default=2)
     p_tr.add_argument("--grad-accum", type=int, default=2)
     p_tr.add_argument("--lr", type=float, default=2.5e-4)

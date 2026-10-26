@@ -29,6 +29,69 @@ from .md_loss import compute_losses
 from .md_model import MyDriveModel
 
 
+_PLANNER_STRUCT_PREFIXES = (
+    "planner.init_head.",
+    "planner.refine_heads.",
+    "planner.ego_motion_mlp.",
+    "planner.bern",
+    "planner.anchor_offsets",
+)
+
+
+def check_ckpt_compat(ckpt: Dict, cfg: Config, skipped: List[str],
+                      source: str = "checkpoint",
+                      missing: Optional[List[str]] = None,
+                      own_keys: Optional[List[str]] = None) -> None:
+    """结构演进时 fail-fast：禁止把旧结构 checkpoint 静默半载入。
+
+    shape 过滤（strict=False）保证代码能跑，但 planner 头 / 运动编码 / Bernstein
+    基座 / anchor 的形状变化会让“换表征”的实验静默退化成部分随机初始化。
+    这里把已知结构键与 cfg 元信息显式对账：旧 raw 头(24↔8)、旧 Fourier 编码
+    (39↔3)、旧 Bernstein 基座（控制点数变化）、带 anchor_offsets 的旧 ckpt
+    都直接报错，避免训出一个无法解释的模型。完全不带 planner 的 ckpt（如
+    stage0 预训练）例外：允许 planner 随机初始化。
+    """
+    # stage0 是 pretext（planner 未训练，权重随机）：下游换表征时 planner 头本就
+    # 该重新初始化，不能拿 stage0 的随机 planner 结构做 fail-fast。
+    if ckpt.get("stage") == 0:
+        return
+    missing_set = set(missing or [])
+    if own_keys is None:
+        has_planner = True
+    else:
+        has_planner = (
+            any(k.startswith("planner.") for k in skipped)
+            or any(k.startswith("planner.") and k not in missing_set
+                   for k in own_keys))
+    meta = ckpt.get("cfg") or {}
+    if has_planner and "traj_repr" in meta and meta["traj_repr"] != cfg.traj_repr:
+        raise ValueError(
+            f"{source} 的 cfg.traj_repr={meta['traj_repr']!r} 与当前 "
+            f"cfg.traj_repr={cfg.traj_repr!r} 不一致；换表征请从原始 DINO/"
+            "干净 ckpt 重训，不要从旧 planner 头热启动")
+    if (has_planner and cfg.traj_repr == "bezier" and "bezier_n_ctrl" in meta
+            and meta["bezier_n_ctrl"] != cfg.bezier_n_ctrl):
+        raise ValueError(
+            f"{source} 的 cfg.bezier_n_ctrl={meta['bezier_n_ctrl']!r} 与当前 "
+            f"cfg.bezier_n_ctrl={cfg.bezier_n_ctrl!r} 不一致；控制点数变化会"
+            "改变 Bernstein 基座与头维度，请从干净 ckpt 重训")
+    bad = [k for k in skipped if k.startswith(_PLANNER_STRUCT_PREFIXES)]
+    # 完全不带 planner 的 ckpt（如 stage0 预训练）允许 planner 随机初始化；
+    # 只有 ckpt 已带部分 planner 结构、却又缺当前结构键时，才视为半截/旧版 ckpt。
+    missing_struct = [k for k in (missing or [])
+                      if k.startswith(_PLANNER_STRUCT_PREFIXES)]
+    if missing_struct:
+        partial = any(k.startswith("planner.") and k not in missing_set
+                      for k in (own_keys or []))
+        if partial:
+            bad += missing_struct
+    if bad:
+        raise ValueError(
+            f"{source} 有 {len(bad)} 个 planner 结构键形状/存在性不匹配"
+            f"（如 {bad[0]}）；拒绝静默部分载入。请用 --init-from 指向同表征/"
+            "同控制点数的 ckpt，或从零训练 stage1")
+
+
 class WarmupCosine:
     """线性 warmup + cosine 学习率（按 optimizer step）。
 
@@ -169,11 +232,14 @@ def train(stage: int, cfg: Config, cache_root: Path, out_dir: Path,
     model = MyDriveModel(cfg).to(device)
     if init_from is not None:
         ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
-        # 形状匹配的键才载入（结构演进时旧 checkpoint 的不匹配键直接跳过，如换 planner 头）
+        # 形状匹配的键才载入；随后 check_ckpt_compat 对旧 planner 结构 fail-fast
         own = model.state_dict()
         compatible = {k: v for k, v in ckpt["model"].items()
                       if k in own and own[k].shape == v.shape}
         skipped = [k for k in ckpt["model"] if k not in compatible]
+        missing = [k for k in own if k not in compatible]
+        check_ckpt_compat(ckpt, cfg, skipped, source=str(init_from),
+                          missing=missing, own_keys=list(own))
         model.load_state_dict(compatible, strict=False)
         print(f"载入 {init_from}（stage {ckpt.get('stage')} epoch {ckpt.get('epoch')}）"
               f" 匹配 {len(compatible)}/{len(own)} 键，跳过 {len(skipped)} 个不匹配键"
@@ -220,6 +286,8 @@ def train(stage: int, cfg: Config, cache_root: Path, out_dir: Path,
         torch.save(state, out_dir / "last.pt")
         marker = ""
         if do_eval:
+            # P0 只补双口径指标；best_val 仍按 val_loss 选模——改判据会改变训练行为，
+            # 等 traj_ade_argmax 与 geo 口径都跑过一轮再决定是否切换。
             crit = eval_m.get("loss", train_m["loss"])
             if crit < best_val:
                 best_val = crit
@@ -294,9 +362,23 @@ def main() -> None:
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--no-tb", action="store_true")
     ap.add_argument("--cpu", action="store_true")
+    # ---- 轨迹表征 / top-k 监督 / 几何重打分（默认开；raw / topk=1 / --geo-rescore-off 可回退消融） ----
+    ap.add_argument("--traj-repr", type=str, default="bezier", choices=["bezier", "raw"],
+                    help="轨迹表征：bezier=Bézier 控制点（默认）/ raw=逐点回归（旧行为）")
+    ap.add_argument("--bezier-ctrl", type=int, default=5,
+                    help="Bézier 控制点数（含固定起点，默认 5；4=三次曲线）")
+    ap.add_argument("--topk", type=int, default=5,
+                    help="每层监督的 top-k proposal 数（默认 5；1=旧 WTA）")
+    ap.add_argument("--topk-decay", type=float, default=0.5,
+                    help="top-k 第 j 名权重衰减（decay^(j-1)，归一化）")
+    ap.add_argument("--geo-rescore-off", action="store_true",
+                    help="关闭推理时几何重打分（旧 argmax(scorer) 行为）")
     args = ap.parse_args()
     cfg = Config(batch_size=args.batch_size, grad_accum=args.grad_accum,
-                 lr=args.lr, num_workers=args.num_workers, amp=not args.no_amp)
+                 lr=args.lr, num_workers=args.num_workers, amp=not args.no_amp,
+                 traj_repr=args.traj_repr, bezier_n_ctrl=args.bezier_ctrl,
+                 w_traj_topk=args.topk, topk_weight_decay=args.topk_decay,
+                 geo_rescore=not args.geo_rescore_off)
     epochs = args.epochs or {1: cfg.epochs_stage1, 2: cfg.epochs_stage2,
                              3: cfg.epochs_stage3}[args.stage]
     out_dir = Path(args.out_dir or (WORK_ROOT / "runs" / f"stage{args.stage}"))

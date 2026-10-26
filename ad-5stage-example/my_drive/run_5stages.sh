@@ -42,6 +42,13 @@
 #   MAX_LOGS      数据准备时最多扫描的日志数（默认 2000）
 #   EXTRA         追加给 md_train 的额外参数（如 --limit-batches 4 --no-tb）
 #   DRY_RUN=1     只打印命令不执行
+#
+# 轨迹表征 / top-k / 几何重打分开关（TopoCurve arXiv:2610.09118 / MGMP arXiv:2610.10646 借鉴，默认开）：
+#   TRAJ_REPR     轨迹表征：bezier（默认，Bézier 控制点）/ raw（旧逐点回归）
+#   BEZIER_CTRL   控制点数（默认 5；4 = 三次曲线）
+#   TOPK          每层监督 top-k（默认 5；1 = 旧 WTA）
+#   TOPK_DECAY    top-k 第 j 名权重衰减（默认 0.5）
+#   GEO_RESCORE=0  关推理几何重打分
 # =============================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -82,6 +89,11 @@ TEST_COUNT="${TEST_COUNT:-1500}"
 NUM_WINDOWS="${NUM_WINDOWS:-50000}"
 MAX_LOGS="${MAX_LOGS:-2000}"
 EXTRA="${EXTRA:-}"
+TRAJ_REPR="${TRAJ_REPR:-bezier}"
+BEZIER_CTRL="${BEZIER_CTRL:-5}"
+TOPK="${TOPK:-5}"
+TOPK_DECAY="${TOPK_DECAY:-0.5}"
+GEO_RESCORE="${GEO_RESCORE:-1}"
 
 # 命令执行器：DRY_RUN=1 时只打印
 run() { if [ "${DRY_RUN:-0}" = "1" ]; then printf '%s\n' "$*"; else "$@"; fi; }
@@ -110,6 +122,11 @@ if [ -n "$SIGREG_WEIGHT" ]; then S0_EXTRA+=(--sigreg-weight "$SIGREG_WEIGHT"); f
 if [ -n "$SIGREG_DIRS" ]; then S0_EXTRA+=(--sigreg-dirs "$SIGREG_DIRS"); fi
 if [ "$ROLLOUT" = "1" ]; then S0_EXTRA+=(--rollout); fi
 if [ "$NO_PLAN_EVAL" = "1" ]; then S0_EXTRA+=(--no-plan-eval); fi
+
+# stage 1-3 附加参数（轨迹表征 / top-k 监督 / 几何重打分）
+SFT_EXTRA=(--traj-repr "$TRAJ_REPR" --bezier-ctrl "$BEZIER_CTRL"
+           --topk "$TOPK" --topk-decay "$TOPK_DECAY")
+if [ "$GEO_RESCORE" = "0" ]; then SFT_EXTRA+=(--geo-rescore-off); fi
 
 INIT1=()
 if [ -n "$STAGE0_CKPT" ]; then
@@ -140,7 +157,7 @@ fi
 
 echo "==================== stage 1: LoRA + Planner（冻结 DINO）===================="
 run python -m my_drive.train.md_train --stage 1 --epochs "$EPOCHS1" --lr "$LR1" \
-    "${INIT1[@]}" \
+    "${INIT1[@]}" "${SFT_EXTRA[@]}" \
     --cache-root "$CACHE" --out-dir "$RUNS/stage1" \
     --batch-size $BATCH --grad-accum $ACCUM --num-workers $WORKERS --patience $PATIENCE $EXTRA
 
@@ -150,7 +167,9 @@ if [ "${SKIP_GRPO}" = "1" ]; then
     INIT2=(--init-from "$(best_of "$RUNS/stage1")")
 elif has_val "$CACHE/index.json"; then
     echo "==================== stage 1.5: GRPO（scorer 强化微调）===================="
+    GRPO_EXTRA=(--traj-repr "$TRAJ_REPR" --bezier-ctrl "$BEZIER_CTRL")
     run python -m my_drive.train.md_grpo --init-from "$(best_of "$RUNS/stage1")" \
+        "${GRPO_EXTRA[@]}" \
         --cache-root "$CACHE" --out-dir "$RUNS/grpo" --epochs "$GRPO_EPOCHS" \
         --batch-size $BATCH --grad-accum $ACCUM --num-workers $WORKERS
     INIT2=(--init-from "$(grpo_best "$RUNS/grpo")")
@@ -161,13 +180,13 @@ fi
 
 echo "==================== stage 2: 仅 BEV（冻结 DINO+LoRA+Planner）===================="
 run python -m my_drive.train.md_train --stage 2 --epochs "$EPOCHS2" --lr "$LR2" \
-    "${INIT2[@]}" \
+    "${INIT2[@]}" "${SFT_EXTRA[@]}" \
     --cache-root "$CACHE" --out-dir "$RUNS/stage2" \
     --batch-size $BATCH --grad-accum $ACCUM --num-workers $WORKERS --patience $PATIENCE $EXTRA
 
 echo "==================== stage 3: LoRA + Planner + BEV 联合 ===================="
 run python -m my_drive.train.md_train --stage 3 --epochs "$EPOCHS3" --lr "$LR3" \
-    --init-from "$(best_of "$RUNS/stage2")" \
+    --init-from "$(best_of "$RUNS/stage2")" "${SFT_EXTRA[@]}" \
     --cache-root "$CACHE" --out-dir "$RUNS/stage3" \
     --batch-size $BATCH --grad-accum $ACCUM --num-workers $WORKERS --patience $PATIENCE $EXTRA
 

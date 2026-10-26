@@ -8,6 +8,7 @@
   vehicle/vru）+ 中心偏移 / log 尺寸 / (sin,cos) yaw 回归目标（100×100 @ 0.5m/px）。
 """
 from __future__ import annotations
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import cv2
 import numpy as np
 from nuplan.common.maps.abstract_map import SemanticMapLayer
 from ..md_common import Config
+
+logger = logging.getLogger(__name__)
 
 # (label, 地图图层)——按绘制顺序排列，后者覆盖前者：
 # roadblock 垫底（大路面），lane/路口覆盖之，人行设施优先级最高。
@@ -59,6 +62,7 @@ def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndar
     from nuplan.common.actor_state.state_representation import Point2D
     hm, wm = cfg.bev_map_size
     canvas = np.zeros((hm, wm), dtype=np.uint8)
+    dropped = 0
     for label, layers in MAP_LAYER_SPEC:
         try:
             objs = map_api.get_proximal_map_objects(
@@ -74,14 +78,38 @@ def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndar
                     continue
                 local = _geometry_local(polygon, ego_pose_xyyaw)
                 if local.is_empty:
+                    dropped += 1
                     continue
-                try:
-                    pts = _to_px(np.asarray(local.exterior.coords, dtype=np.float64), cfg,
-                                 cfg.bev_map_stride)
-                except Exception:  # noqa: BLE001  退化多边形
-                    continue
-                cv2.fillPoly(layer_mask, [pts], 255)
+                # nuPlan 的 polygon 可能是 MultiPolygon（一个对象多个不相连
+                # 区域）。旧代码直接访问 .exterior 会抛 AttributeError，又被下面
+                # 的 except 静默吞掉，导致该对象整块从 CE 标签消失且无日志。
+                if local.geom_type == "MultiPolygon":
+                    parts = list(local.geoms)
+                elif local.geom_type == "Polygon":
+                    parts = [local]
+                else:
+                    parts = []
+                if not parts:
+                    dropped += 1
+                for part in parts:
+                    if part.is_empty or part.exterior is None:
+                        dropped += 1
+                        continue
+                    try:
+                        pts = _to_px(np.asarray(part.exterior.coords, dtype=np.float64),
+                                     cfg, cfg.bev_map_stride)
+                    except Exception:  # noqa: BLE001  退化多边形
+                        dropped += 1
+                        continue
+                    try:
+                        cv2.fillPoly(layer_mask, [pts], 255)
+                    except cv2.error:  # 少于 3 个有效点等退化情形
+                        dropped += 1
+                        continue
         canvas[layer_mask > 0] = label
+    if dropped:
+        logger.warning("build_map_label: %d 个地图几何体无法栅格化（非 Polygon/"
+                       "MultiPolygon、空 exterior 或退化坐标），已跳过", dropped)
     return canvas
 
 
