@@ -2,10 +2,8 @@
 
 DINO-Foresight 化 + AD-E2E-JEPA 化版本（相对旧版升级，均可经 Config 回退消融）：
   1) 预测器：时空可分离注意力（_ForesightBlock，cfg.foresight_spatial）；
-  2) 预测目标三选一（cfg.foresight_target）：
-     - "pca"：冻结目标分支的多层特征 concat（第 3/6/9/12 层，1536 维）经 PCA
-       压缩到 cfg.foresight_pca_dim 维，PCA 由 prepare-pca 离线预计算；
-     - "last"：仅末层 384 维（旧行为）；
+  2) 预测目标两选一（cfg.foresight_target）：
+     - "last"：仅末层 384 维（旧行为/消融）；
      - "proj"：可学习 PatchProjector + SIGReg（AD-E2E-JEPA，arXiv:2609.34085）。
        两个 stride-2 卷积把 24×40 patch 网格压到 6×10（16× 更少 patch）、
        256 维压到 64 维（4× 降维），在线/目标分支共享（论文 Eq.7-9）；
@@ -29,9 +27,7 @@ DINO-Foresight 化 + AD-E2E-JEPA 化版本（相对旧版升级，均可经 Conf
 用法：
     # 0) 数据准备（扫描 + 图像本地化；与旧 5 帧缓存不兼容，需重建）
     python -m my_drive.train.md_pretext prepare --num-windows 50000
-    # 1) PCA 目标矩阵预计算（仅 foresight_target="pca" 时需要）
-    python -m my_drive.train.md_pretext prepare-pca
-    # 2) 预训练（proj 模式：projector+SIGReg；可选 --rollout 开 rollout 一致性）
+    # 1) 预训练（proj 模式：projector+SIGReg；可选 --rollout 开 rollout 一致性）
     python -m my_drive.train.md_pretext train --epochs 10 --target proj \
         --sigreg-weight 0.09 [--rollout]
     # 之后：md_train --stage 1 --init-from <pretext>/best_val.pt
@@ -58,68 +54,10 @@ from .md_train import WarmupCosine
 
 
 def _build_model_with_target(cfg: Config, device: torch.device) -> MyDriveModel:
-    """构建模型并建立冻结目标分支（train 与 prepare-pca 共用）。"""
+    """构建模型并建立冻结目标分支（stage 0 训练用）。"""
     model = MyDriveModel(cfg).to(device)
     model.make_frozen_target_branch()
     return model
-
-
-def prepare_pca(cfg: Config, cache_root: Path, out_path: Path,
-                num_windows: int, patches_per_window: int) -> Path:
-    """离线预计算 PCA 目标矩阵（DINO-Foresight 的关键组件：压缩 + 去噪 + 正则）。
-
-    在冻结目标分支的第 3/6/9/12 层 concat 特征（1536 维）上，对训练窗口的目标帧
-    随机采样 patch，累计一阶/二阶统计量后特征值分解，取前 pca_dim 个主成分。
-    结果存 pca.pt：{"mean": (1536,), "components": (pca_dim,1536), ...}。
-    注意：仅 foresight_target="pca" 时需要；"proj" 模式用可学习 projector 替代。
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_model_with_target(cfg, device)
-    model.eval()
-    ds = PretextDataset(cache_root, cfg, "train", augment=False)  # 统计用原图，不开增强
-    n_win = min(num_windows, len(ds))
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
-                        num_workers=cfg.num_workers, pin_memory=True,
-                        sampler=SubsetRandomSampler(
-                            torch.randperm(len(ds))[:n_win].tolist()))
-    in_dim = model.encoder.embed_dim * 4                          # 1536
-    s = torch.zeros(in_dim, dtype=torch.float64)
-    q = torch.zeros(in_dim, in_dim, dtype=torch.float64)
-    n = 0
-    k_max = cfg.foresight_max_step
-    for i, batch in enumerate(loader):
-        imgs = batch["imgs"].to(device, non_blocking=True)         # (B,8,3,H,W)
-        k = int(torch.randint(1, k_max + 1, ()).item())            # 各时距目标都入统计
-        B = imgs.shape[0]
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
-                                             enabled=cfg.amp and device.type == "cuda"):
-            st = model._tgt_scene_embeds[:, 0].expand(B, -1, -1)
-            final, inters = model._tgt_encoder.model.forward_features(imgs[:, 3 + k], st)
-            n_pre = model._tgt_encoder.n_prefix
-            raw = torch.cat([t[:, n_pre:] for t in inters] + [final[:, n_pre:]],
-                            dim=-1)                                # (B,P,1536)
-        x = raw.float().reshape(-1, in_dim)
-        take = min(patches_per_window * imgs.shape[0], x.shape[0])
-        x = x[torch.randperm(x.shape[0], device=x.device)[:take]].double().cpu()
-        s += x.sum(0)
-        q += x.T @ x
-        n += x.shape[0]
-        if (i + 1) % 50 == 0:
-            print(f"[prepare-pca] {i + 1} 批 / 累计 {n} patch", flush=True)
-    mean = s / n
-    cov = q / n - torch.outer(mean, mean)
-    evals, evecs = torch.linalg.eigh(cov)                          # 升序
-    pca_dim = min(cfg.foresight_pca_dim, in_dim)
-    comps = evecs[:, -pca_dim:].flip(-1).T.contiguous()            # (pca_dim,1536) 降序
-    explained = float(evals[-pca_dim:].sum() / evals.sum())
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"mean": mean.float(), "components": comps.float(),
-                "in_dim": in_dim, "pca_dim": pca_dim, "n_samples": n,
-                "explained_var": explained}, out_path)
-    print(f"[prepare-pca] 完成：{n} patch，前 {pca_dim} 主成分解释方差 {explained:.3f}"
-          f" → {out_path}")
-    return out_path
 
 
 # --------------------------------------------------------------------------- #
@@ -223,7 +161,7 @@ def run_epoch(model, predictor, loader, cfg, device, optimizer=None,
 
     def _pred_loss(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         """proj 模式用 MSE（论文 Eq.9，目标侧 sg 由调用处 detach 保证）；
-        pca/last 保持旧版 smooth_l1。"""
+        last 保持旧版 smooth_l1。"""
         if proj_mode:
             return F.mse_loss(pred.float(), tgt.detach().float())
         return F.smooth_l1_loss(pred.float(), tgt.float(), beta=0.1)
@@ -333,7 +271,7 @@ def run_epoch(model, predictor, loader, cfg, device, optimizer=None,
 
 def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
                   patience: int = 3, eval_every: int = 1, tb: bool = True,
-                  limit_batches: int = 0, pca_path: Optional[Path] = None,
+                  limit_batches: int = 0,
                   init_from: Optional[Path] = None,
                   horizon: Optional[int] = None) -> Path:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -348,8 +286,6 @@ def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
                             num_workers=0, pin_memory=True)
     proj_mode = cfg.foresight_target == "proj"
     model = _build_model_with_target(cfg, device)
-    if cfg.foresight_target == "pca":
-        model.load_foresight_pca(pca_path or (Path(cache_root) / "pca.pt"))
     predictor = ForesightPredictor(cfg).to(device)
     if init_from is not None:
         # 分辨率课程热启动：低分辨率 stage-0 checkpoint → 高分辨率续训。
@@ -362,8 +298,6 @@ def train_pretext(cfg: Config, cache_root: Path, out_dir: Path, epochs: int,
               f"unexpected={m_unexp} | predictor missing={p_missing} "
               f"unexpected={p_unexp}")
         model.make_frozen_target_branch()          # init-from 后重建冻结目标分支
-        if cfg.foresight_target == "pca" and not bool(model.foresight_pca_ready):
-            model.load_foresight_pca(pca_path or (Path(cache_root) / "pca.pt"))
     # 可训：LoRA 组（含 neck/scene_embeds）+ predictor；DINO 主干/planner/BEV 冻结；
     # proj 模式再加 foresight projector（其余模式 projector 不前向，保持冻结）
     groups = model.param_groups()
@@ -459,14 +393,6 @@ def main() -> None:
     p_prep.add_argument("--max-logs", type=int, default=2000)
     p_prep.add_argument("--cache-root", type=str,
                         default=str(WORK_ROOT / "cache_pretext"))
-    p_pca = sub.add_parser("prepare-pca")
-    p_pca.add_argument("--cache-root", type=str,
-                       default=str(WORK_ROOT / "cache_pretext"))
-    p_pca.add_argument("--out", type=str, default="")
-    p_pca.add_argument("--num-windows", type=int, default=0,
-                       help="默认 cfg.foresight_pca_windows")
-    p_pca.add_argument("--patches-per-window", type=int, default=0,
-                       help="默认 cfg.foresight_pca_patches")
     p_tr = sub.add_parser("train")
     p_tr.add_argument("--epochs", type=int, default=10)
     p_tr.add_argument("--cache-root", type=str, default=str(WORK_ROOT / "cache_pretext"))
@@ -477,10 +403,8 @@ def main() -> None:
     p_tr.add_argument("--num-workers", type=int, default=4)
     p_tr.add_argument("--patience", type=int, default=3)
     p_tr.add_argument("--limit-batches", type=int, default=0)
-    p_tr.add_argument("--pca", type=str, default="",
-                      help="PCA 矩阵路径（默认 <cache_root>/pca.pt；仅 pca 模式）")
     p_tr.add_argument("--target", type=str, default="",
-                      choices=["", "pca", "last", "proj"],
+                      choices=["", "last", "proj"],
                       help="覆盖 cfg.foresight_target；proj=可学习 projector+SIGReg")
     p_tr.add_argument("--sigreg-weight", type=float, default=-1.0,
                       help="覆盖 cfg.foresight_sigreg_weight（λ；<0 用配置值）")
@@ -520,18 +444,10 @@ def main() -> None:
         prepare_pretext_dataset(cfg, num_windows=args.num_windows,
                                 cache_root=Path(args.cache_root),
                                 max_logs=args.max_logs)
-    elif args.cmd == "prepare-pca":
-        prepare_pca(cfg, Path(args.cache_root),
-                    Path(args.out) if args.out
-                    else Path(args.cache_root) / "pca.pt",
-                    num_windows=args.num_windows or cfg.foresight_pca_windows,
-                    patches_per_window=(args.patches_per_window
-                                        or cfg.foresight_pca_patches))
     else:
         train_pretext(cfg, Path(args.cache_root), Path(args.out_dir),
                       epochs=args.epochs, patience=args.patience,
                       tb=not args.no_tb, limit_batches=args.limit_batches,
-                      pca_path=Path(args.pca) if args.pca else None,
                       init_from=Path(args.init_from) if args.init_from else None,
                       horizon=args.horizon or None)
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -130,6 +131,7 @@ def run_epoch(model: MyDriveModel, loader: DataLoader, cfg: Config, flags: Dict[
     sums: Dict[str, float] = {}
     count = 0
     micro = 0
+    map_conf = None
     t0 = time.time()
     for i, batch in enumerate(loader):
         if limit_batches and i >= limit_batches:
@@ -141,12 +143,14 @@ def run_epoch(model: MyDriveModel, loader: DataLoader, cfg: Config, flags: Dict[
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.amp):
                 pred = model(batch, with_planner=flags["with_planner"],
                              with_bev=flags["with_bev"],
-                             dino_no_grad=flags["dino_no_grad"])
+                             dino_no_grad=flags["dino_no_grad"],
+                             with_occ=flags.get("with_occ", False))
                 losses = compute_losses(pred, batch, cfg,
-                                        flags["with_planner"], flags["with_bev"])
-            return losses
+                                        flags["with_planner"], flags["with_bev"],
+                                        score_only=cfg.score_only)
+            return pred, losses
         if training:
-            losses = _forward()
+            pred, losses = _forward()
             # 梯度累积：loss 不预除 accum，更新时按本组实际微批数归一化
             # （若 loss/accum，尾批不足 accum 个微批时梯度会被欠缩放）
             losses["loss"].backward()
@@ -165,12 +169,26 @@ def run_epoch(model: MyDriveModel, loader: DataLoader, cfg: Config, flags: Dict[
                     scheduler.step()
         else:
             with torch.no_grad():
-                losses = _forward()
+                pred, losses = _forward()
         bs = batch["traj"].shape[0]
+        if flags["with_bev"] and "map_logits" in pred and "bev_map" in batch:
+            # 全局 mIoU：按总 confusion 累计，避免 batch 内宏平均的类别出现偏差。
+            pred_cls = pred["map_logits"].argmax(dim=1).reshape(-1)
+            gt_cls = batch["bev_map"].long().reshape(-1)
+            idx = gt_cls * 4 + pred_cls
+            conf = torch.bincount(idx, minlength=16).reshape(4, 4).to(torch.float64)
+            map_conf = conf if map_conf is None else map_conf + conf
         count += bs
         for k, v in losses.items():
             sums[k] = sums.get(k, 0.0) + float(v.detach()) * bs
     metrics = {k: v / max(1, count) for k, v in sums.items()}
+    if map_conf is not None:
+        diag = torch.diagonal(map_conf)
+        union = map_conf.sum(1) + map_conf.sum(0) - diag
+        # 前景类（lane/roadblock/walkway）全局 IoU，再平均；忽略无 union 的类。
+        valid = union[1:] > 0
+        metrics["map_miou_global"] = float(
+            (diag[1:][valid] / union[1:][valid]).mean()) if valid.any() else 0.0
     metrics["sec"] = time.time() - t0
     return metrics
 def evaluate(model, loader, cfg, flags, device) -> Dict[str, float]:
@@ -201,6 +219,20 @@ def select_viz_indices(viz_ds, n: int = 10, max_per_log_scan: int = 60) -> List[
         if len(picked) >= n:
             break
     return sorted(picked[:n])
+def _seed_worker(worker_id: int) -> None:
+    seed = (torch.initial_seed() + worker_id) % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+
+
 def _make_loader(cache_root: Path, cfg: Config, split: str, shuffle: bool,
                  required: bool = False) -> Optional[DataLoader]:
     try:
@@ -211,12 +243,14 @@ def _make_loader(cache_root: Path, cfg: Config, split: str, shuffle: bool,
         return None
     return DataLoader(ds, batch_size=cfg.batch_size, shuffle=shuffle,
                       num_workers=cfg.num_workers if shuffle else 0, pin_memory=True,
-                      drop_last=False, persistent_workers=shuffle and cfg.num_workers > 0)
+                      drop_last=False, persistent_workers=shuffle and cfg.num_workers > 0,
+                      worker_init_fn=_seed_worker if shuffle else None)
 def train(stage: int, cfg: Config, cache_root: Path, out_dir: Path,
           init_from: Optional[Path] = None, epochs: int = 30,
           limit_batches: int = 0,
           tb: bool = True, device_str: str = "cuda", eval_every: int = 2,
-          viz_frames: int = 10, patience: int = 6) -> Path:
+          viz_frames: int = 10, patience: int = 6,
+          eval_only: bool = False) -> Path:
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -240,11 +274,40 @@ def train(stage: int, cfg: Config, cache_root: Path, out_dir: Path,
         missing = [k for k in own if k not in compatible]
         check_ckpt_compat(ckpt, cfg, skipped, source=str(init_from),
                           missing=missing, own_keys=list(own))
+        if stage == 3 and cfg.planner_use_bev:
+            # V2 的 planner BEV 旁路是 stage3 才真正训练的；若从旧 stage2
+            # （无这些键）热启动，形状过滤会静默随机初始化，必须拦下。
+            v2_prefixes = ("planner.bev_fusion.", "planner.bev_score_fusion.",
+                           "planner.proposal_bev.", "planner.cost_mlp.")
+            bad_v2 = [k for k in missing if k.startswith(v2_prefixes)]
+            if bad_v2:
+                raise ValueError(
+                    f"{init_from} 缺少 V2 planner BEV 结构键（如 {bad_v2[0]}）；"
+                    "stage3 必须从已包含 BEV 旁路的 V2 stage2 checkpoint 初始化，"
+                    "不要从旧 V1/v4 stage2 直接进 stage3")
         model.load_state_dict(compatible, strict=False)
         print(f"载入 {init_from}（stage {ckpt.get('stage')} epoch {ckpt.get('epoch')}）"
               f" 匹配 {len(compatible)}/{len(own)} 键，跳过 {len(skipped)} 个不匹配键"
               + (f"（如 {skipped[0]}）" if skipped else ""))
     flags = model.set_train_stage(stage)
+    if cfg.train_scope != "stage":
+        flags = model.set_train_scope(cfg.train_scope)
+    if eval_only:
+        if init_from is None:
+            raise SystemExit("--eval-only 需要 --init-from")
+        print(f"eval-only：{init_from} | scope={cfg.train_scope}", flush=True)
+        val_m = evaluate(model, val_loader, cfg, flags, device) if val_loader is not None else {}
+        with open(out_dir / "val_metrics.json", "w") as f:
+            json.dump({"stage": stage, **{f"val_{k}": v for k, v in val_m.items()}}, f, indent=1)
+        print("[EVAL VAL] " + " ".join(f"{k}={v:.4f}" for k, v in sorted(val_m.items())
+                                       if k != "sec"), flush=True)
+        if test_loader is not None:
+            test_m = evaluate(model, test_loader, cfg, flags, device)
+            with open(out_dir / "test_metrics.json", "w") as f:
+                json.dump({"stage": stage, **{f"test_{k}": v for k, v in test_m.items()}}, f, indent=1)
+            print("[EVAL TEST] " + " ".join(f"{k}={v:.4f}" for k, v in sorted(test_m.items())
+                                           if k != "sec"), flush=True)
+        return init_from
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     steps_per_epoch = math.ceil(
@@ -278,6 +341,10 @@ def train(stage: int, cfg: Config, cache_root: Path, out_dir: Path,
         line = " ".join(f"{k}={v:.4f}" for k, v in sorted(train_m.items())
                         if k != "sec")
         eval_str = f" | val_loss={eval_m['loss']:.4f}" if eval_m else ""
+        if eval_m and "map_miou_global" in eval_m:
+            eval_str += f" | val_map_global={eval_m['map_miou_global']:.4f}"
+        if eval_m and "traj_regret" in eval_m:
+            eval_str += f" | val_regret={eval_m['traj_regret']:.4f}"
         print(f"[s{stage} e{epoch:03d}] lr={lr:.2e} {line}{eval_str} ({train_m['sec']:.1f}s)",
               flush=True)
         # checkpoint：last 恒存；best_val 只在评估 epoch 按 val_loss 更新
@@ -286,14 +353,27 @@ def train(stage: int, cfg: Config, cache_root: Path, out_dir: Path,
         torch.save(state, out_dir / "last.pt")
         marker = ""
         if do_eval:
-            # P0 只补双口径指标；best_val 仍按 val_loss 选模——改判据会改变训练行为，
-            # 等 traj_ade_argmax 与 geo 口径都跑过一轮再决定是否切换。
-            crit = eval_m.get("loss", train_m["loss"])
+            # stage2 默认仍按 val_loss（兼容旧口径）；仅显式 --stage2-select map 时
+            # 按全局 mIoU 选模（越大越好，内部取负号）；stage1/3 固定 val_loss。
+            if (stage == 2 and cfg.stage2_select == "map"
+                    and "map_miou_global" in eval_m):
+                crit = -eval_m["map_miou_global"]
+                crit_name = "map_miou_global"
+            elif (cfg.train_scope in ("scorer", "scorer_bev")
+                  and "traj_regret" in eval_m):
+                # B/C 实验按 val regret 选点（越小越好），不再用混合 val_loss。
+                crit = eval_m["traj_regret"]
+                crit_name = "traj_regret"
+            else:
+                crit = eval_m.get("loss", train_m["loss"])
+                crit_name = "loss"
             if crit < best_val:
                 best_val = crit
                 bad_evals = 0
                 torch.save(state, out_dir / "best_val.pt")
-                marker = " ★best"
+                if stage == 2:
+                    torch.save(state, out_dir / "best_map.pt")
+                marker = f" ★best({crit_name})"
             else:
                 bad_evals += 1
                 marker = f" (bad {bad_evals}/{patience})"
@@ -362,6 +442,8 @@ def main() -> None:
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--no-tb", action="store_true")
     ap.add_argument("--cpu", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--eval-only", action="store_true")
     # ---- 轨迹表征 / top-k 监督 / 几何重打分（默认开；raw / topk=1 / --geo-rescore-off 可回退消融） ----
     ap.add_argument("--traj-repr", type=str, default="bezier", choices=["bezier", "raw"],
                     help="轨迹表征：bezier=Bézier 控制点（默认）/ raw=逐点回归（旧行为）")
@@ -373,12 +455,64 @@ def main() -> None:
                     help="top-k 第 j 名权重衰减（decay^(j-1)，归一化）")
     ap.add_argument("--geo-rescore-off", action="store_true",
                     help="关闭推理时几何重打分（旧 argmax(scorer) 行为）")
+    # ---- scorer-only / ranking 实验 ----
+    ap.add_argument("--freeze-scope", type=str, default="stage",
+                    choices=["stage", "scorer", "scorer_bev", "joint_groups"],
+                    help="stage=旧三阶段；scorer=只训排序头；scorer_bev=另训 bev_score_fusion")
+    ap.add_argument("--stage2-select", type=str, default="loss", choices=["loss", "map"],
+                    help="stage2 选点：loss=旧 val_loss；map=按全局 map mIoU（显式实验）")
+    ap.add_argument("--score-only", action="store_true",
+                    help="只反传 score loss（配合 --freeze-scope scorer）")
+    ap.add_argument("--score-listwise", action="store_true",
+                    help="加 listwise soft-ADE 排序损失（C 实验）")
+    ap.add_argument("--listwise-temp", type=float, default=0.10,
+                    help="listwise 软标签温度（米）")
+    ap.add_argument("--w-score-listwise", type=float, default=0.5,
+                    help="listwise 损失相对权重")
+    # ---- 地图 PA+BANE：只增加训练辅助损失，验证/推理前向不变 ----
+    ap.add_argument("--map-ccl", action="store_true",
+                    help="启用地图 Pixel-to-Anchor + BANE 边界困难负样本")
+    ap.add_argument("--map-ccl-weight", type=float, default=0.1,
+                    help="PA+BANE 辅助损失权重（默认 0.1）")
+    ap.add_argument("--map-ccl-temp", type=float, default=0.1,
+                    help="归一化 embedding 点积温度")
+    ap.add_argument("--map-ccl-bane-ratio", type=float, default=0.5,
+                    help="每类误分类像素中选取的边界困难负样本比例")
+    # ---- TOAD：测试时控制空间 CEM（默认关；--toad 开启） ----
+    ap.add_argument("--toad", action="store_true",
+                    help="开启 TOAD 测试时轨迹优化（仅 eval，不改训练损失）")
+    ap.add_argument("--toad-iters", type=int, default=5, help="CEM 迭代轮数")
+    ap.add_argument("--toad-samples", type=int, default=64, help="每轮采样轨迹数")
+    ap.add_argument("--toad-elites", type=int, default=8, help="每轮 elite 数")
+    ap.add_argument("--toad-std-scale", type=float, default=0.5,
+                    help="proposal 控制标准差缩放（trust region 初始范围）")
+    ap.add_argument("--toad-anchor-weight", type=float, default=0.5,
+                    help="CEM 内 anchor L2 权重")
+    ap.add_argument("--toad-comfort-weight", type=float, default=0.05,
+                    help="舒适约束权重（搜索与接受门控共用）")
+    ap.add_argument("--toad-seed", type=int, default=2, help="CEM 随机种子")
     args = ap.parse_args()
+    seed_everything(args.seed)
     cfg = Config(batch_size=args.batch_size, grad_accum=args.grad_accum,
                  lr=args.lr, num_workers=args.num_workers, amp=not args.no_amp,
+                 seed=args.seed,
                  traj_repr=args.traj_repr, bezier_n_ctrl=args.bezier_ctrl,
                  w_traj_topk=args.topk, topk_weight_decay=args.topk_decay,
-                 geo_rescore=not args.geo_rescore_off)
+                 geo_rescore=not args.geo_rescore_off,
+                 train_scope=args.freeze_scope, stage2_select=args.stage2_select,
+                 score_only=args.score_only,
+                 score_listwise=args.score_listwise,
+                 score_listwise_temp=args.listwise_temp,
+                 w_score_listwise=args.w_score_listwise,
+                 map_ccl_enabled=args.map_ccl, w_map_ccl=args.map_ccl_weight,
+                 map_ccl_temperature=args.map_ccl_temp,
+                 map_ccl_bane_ratio=args.map_ccl_bane_ratio,
+                 toad_enabled=args.toad, toad_iterations=args.toad_iters,
+                 toad_samples=args.toad_samples, toad_elites=args.toad_elites,
+                 toad_std_scale=args.toad_std_scale,
+                 toad_anchor_weight=args.toad_anchor_weight,
+                 toad_comfort_weight=args.toad_comfort_weight,
+                 toad_seed=args.toad_seed)
     epochs = args.epochs or {1: cfg.epochs_stage1, 2: cfg.epochs_stage2,
                              3: cfg.epochs_stage3}[args.stage]
     out_dir = Path(args.out_dir or (WORK_ROOT / "runs" / f"stage{args.stage}"))
@@ -386,6 +520,7 @@ def main() -> None:
           init_from=Path(args.init_from) if args.init_from else None,
           epochs=epochs, limit_batches=args.limit_batches, tb=not args.no_tb,
           device_str="cpu" if args.cpu else "cuda", eval_every=args.eval_every,
-          viz_frames=args.viz_frames, patience=args.patience)
+          viz_frames=args.viz_frames, patience=args.patience,
+          eval_only=args.eval_only)
 if __name__ == "__main__":
     main()

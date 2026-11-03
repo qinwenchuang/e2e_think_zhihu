@@ -59,7 +59,7 @@ class Config:
     map_query_radius: float = 60.0                    # 地图对象查询半径（米）
     # ---- 模型 ----
     d_model: int = 256
-    lora_rank: int = 32
+    lora_rank: int = 64
     num_scene_tokens: int = 16                        # 每相机 register/scene token 数
     bev_layers: int = 3                               # BEV cross-attn 层数
     bev_self_attn: bool = True                        # BEV cell 间自注意力
@@ -69,6 +69,27 @@ class Config:
     num_proposals: int = 64                           # 候选轨迹条数
     decoder_layers: int = 4                           # 逐层精修层数
     scorer_layers: int = 2                            # 质量 scorer 层数
+    # ---- BEV → proposal scorer（V2：占据/BEV 质量特征） ----
+    planner_use_bev: bool = True                      # 将 BEV 质量特征接入 scorer
+    planner_bev_detach: bool = True                   # scorer 梯度不污染地图/检测/占据头
+    planner_cost_hidden: int = 64                     # proposal cost_mlp 隐层
+    planner_occ_z: float = 0.6                        # 轨迹占据查询高度（米）
+    planner_bev_fusion: bool = True                   # 最后一层 decoder 的 BEV 旁路
+    planner_bev_score_fusion: bool = False            # scorer 输入端 BEV cross-attn（消融）
+    planner_score_detach: bool = True                 # scorer 输入 detach（False=分数梯度直达）
+    # ---- 当前帧连续占据监督（可选射线缓存；无数据自动跳过） ----
+    occ_enabled: bool = True
+    occ_num_queries: int = 8192                       # 每样本正负查询总数
+    occ_delta: float = 0.2                            # 表面正样本向后缓冲长度（米）
+    occ_near_ratio: float = 0.5                       # 近场射线采样配额
+    occ_near_x_min: float = -5.0
+    occ_near_x_max: float = 25.0
+    occ_near_y_min: float = -10.0
+    occ_near_y_max: float = 10.0
+    occ_z_min: float = -2.0                           # 超出范围查询不参与损失
+    occ_z_max: float = 6.0
+    occ_fourier_bands: int = 4
+    occ_decoder_offsets: int = 2                      # 可学习局部 BEV 采样偏移数
     # ---- 轨迹表征与监督（借鉴 TopoCurve, arXiv:2610.09118 / MGMP, arXiv:2610.10646） ----
     # traj_repr="bezier"：planner 头输出 Bézier 控制点偏移（P0 固定 ego 原点，
     # heading 由曲线切线解析给出），经 Bernstein 基矩阵投影回 8 个采样位姿——
@@ -92,13 +113,52 @@ class Config:
     w_g_col: float = 3.0                              # 碰撞代理惩罚（预测热力图，8 步取 max）
     w_g_oob: float = 1.0                              # 越界惩罚：任一步 footprint 出图比例的最大值（未知≠安全）
     w_g_prog: float = 0.3                             # 前向进度权重
+
+    # ---- TOAD：测试时控制空间 CEM 优化（仅 eval，不改变训练/Top-k Loss） ----
+    # 冻结 Planner/scorer，在已有 proposals 附近搜索新轨迹；不更新模型。
+    toad_enabled: bool = False
+    toad_iterations: int = 5
+    toad_samples: int = 64
+    toad_elites: int = 8
+    toad_std_scale: float = 0.5
+    toad_std_floor_accel: float = 0.10                # m/s²，避免 proposals 相同时探索塌缩
+    toad_std_floor_yaw_rate: float = 0.025            # rad/s
+    toad_anchor_weight: float = 0.5
+    toad_comfort_weight: float = 0.05
+    toad_seed: int = 2
+    toad_max_accel: float = 2.0                       # m/s²
+    toad_max_lat_accel: float = 3.0                   # m/s²
+    toad_max_jerk: float = 1.5                        # m/s³
+    toad_max_yaw_rate: float = 0.5                    # rad/s
+    toad_max_yaw_accel: float = 0.5                   # rad/s²
+    # ---- scorer-only / ranking 实验（默认关闭，保持旧行为） ----
+    # "stage"：按 set_train_stage 的旧三阶段日程；"scorer"：只训排序头；
+    # "scorer_bev"：额外训 bev_score_fusion；"joint_groups"：保留 stage3 解冻。
+    train_scope: str = "stage"
+    # stage2 选点：loss=旧行为；map=按全局 mIoU 选点（显式实验开关）
+    stage2_select: str = "loss"
+    score_only: bool = False                          # 只反传 score loss（B 实验）
+    score_listwise: bool = False                      # 软 ADE listwise 排序损失（C 实验）
+    score_listwise_temp: float = 0.10                  # listwise 温度（米）
+    w_score_listwise: float = 0.5                      # listwise 相对权重（叠加在 score_reg 上）
+
     # ---- 损失权重 ----
     w_traj: float = 1.0
     w_bev_map: float = 1.0
     w_det_heatmap: float = 1.0
     w_det_reg: float = 0.5
+    w_occ: float = 0.2                                # 当前帧连续占据 BCE 权重
     w_score_ce: float = 0.5                           # proposal 质量分数回归权重
     map_bg_weight: float = 0.3                        # 地图 CE 背景类降权（背景占比高）
+    # ---- 地图 PA+BANE（Contextrast++ arXiv:2608.22679；仅训练前向） ----
+    map_ccl_enabled: bool = False                     # True=PA 对比学习 + 边界困难负样本
+    w_map_ccl: float = 0.1                            # 加在现有地图 CE 之外的辅助损失权重
+    map_ccl_embed_dim: int = 64                       # 1×1 投影头维度；推理时不执行
+    map_ccl_temperature: float = 0.1                  # 归一化特征点积温度
+    map_ccl_bane_ratio: float = 0.5                   # 每类误分类像素中选取的最近边界比例
+    map_ccl_pos_samples: int = 1024                   # 每类正样本上限，控制 PA 显存
+    map_ccl_neg_samples: int = 1024                   # 每类困难负样本上限
+    map_boundary_width: int = 2                       # 边界 mIoU 的 GT 边界带宽（像素）
     # ---- GRPO（stage 1.5） ----
     grpo_temperature: float = 0.5                     # 策略 softmax 温度 τ
     grpo_samples: int = 8                             # 每帧采样 proposal 数 k（组大小）
@@ -115,12 +175,8 @@ class Config:
     foresight_layers: int = 6                         # 预测器深度（时空可分离块数）
     foresight_heads: int = 8                          # 预测器注意力头数
     foresight_spatial: bool = True                    # False=纯时序注意力（回退旧行为，消融用）
-    foresight_target: str = "pca"                     # "pca"=多层concat+PCA；"last"=仅末层384维（旧行为）；
-                                                      # "proj"=可学习projector+SIGReg（AD-E2E-JEPA 化，见下）
-    foresight_pca_dim: int = 512                      # PCA 目标维度（输入侧 4 层×384=1536）
+    foresight_target: str = "proj"                    # "proj"=可学习projector+SIGReg；"last"=仅末层384维（旧行为/消融）
     foresight_max_step: int = 4                       # 最大预测时距（×0.5s）；1=旧单步行为（消融用）
-    foresight_pca_windows: int = 2000                 # prepare-pca 采样窗口数
-    foresight_pca_patches: int = 128                  # 每窗口随机采样 patch 数
     # ---- foresight "proj" 模式（AD-E2E-JEPA，arXiv:2609.34085） ----
     # 可学习 patch projector（两层 stride-2 卷积，在线/目标分支共享，论文 Fig.2 a.1）：
     #   patch 数 16×↓（24×40 → 6×10 = 60），嵌入维 4×↓（d_model 256 → proj_dim 64），

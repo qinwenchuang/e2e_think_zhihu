@@ -57,19 +57,39 @@ def _geometry_local(geometry, origin_xyyaw: np.ndarray):
     return affinity.affine_transform(translated, [a, b, d, e, 0, 0])
 
 
+def _polygon_parts(geometry) -> list:
+    """shapely Polygon/MultiPolygon → 可栅格化的 Polygon 列表；其余返回空。"""
+    if geometry.geom_type == "MultiPolygon":
+        return list(geometry.geoms)
+    if geometry.geom_type == "Polygon":
+        return [geometry]
+    return []
+
+
 def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndarray:
-    """生成地图语义分割标签 (Hm, Wm) uint8。地图查询失败时该层留空，绝不抛异常。"""
+    """生成地图语义分割标签 (Hm, Wm) uint8。地图查询失败时留空，绝不抛异常。
+
+    三层地图只查一次：``get_proximal_map_objects`` 的 layers 参数可一次取回
+    全部图层，旧实现每层各查一次（3 次空间索引 + 3 次反序列化）。
+    """
     from nuplan.common.actor_state.state_representation import Point2D
     hm, wm = cfg.bev_map_size
     canvas = np.zeros((hm, wm), dtype=np.uint8)
     dropped = 0
+    all_layers = []
+    for _, layers in MAP_LAYER_SPEC:
+        for layer in layers:
+            if layer not in all_layers:
+                all_layers.append(layer)
+    try:
+        objs = map_api.get_proximal_map_objects(
+            point=Point2D(float(ego_pose_xyyaw[0]), float(ego_pose_xyyaw[1])),
+            radius=cfg.map_query_radius, layers=all_layers)
+    except Exception:  # noqa: BLE001  地图不可用 → 全空标签
+        logger.warning("build_map_label: 地图查询失败，返回空标签", exc_info=True)
+        return canvas
+    objs = objs or {}
     for label, layers in MAP_LAYER_SPEC:
-        try:
-            objs = map_api.get_proximal_map_objects(
-                point=Point2D(float(ego_pose_xyyaw[0]), float(ego_pose_xyyaw[1])),
-                radius=cfg.map_query_radius, layers=list(layers))
-        except Exception:  # noqa: BLE001  地图不可用 → 该层留空
-            continue
         layer_mask = np.zeros((hm, wm), dtype=np.uint8)
         for layer in layers:
             for obj in objs.get(layer, []):
@@ -80,15 +100,7 @@ def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndar
                 if local.is_empty:
                     dropped += 1
                     continue
-                # nuPlan 的 polygon 可能是 MultiPolygon（一个对象多个不相连
-                # 区域）。旧代码直接访问 .exterior 会抛 AttributeError，又被下面
-                # 的 except 静默吞掉，导致该对象整块从 CE 标签消失且无日志。
-                if local.geom_type == "MultiPolygon":
-                    parts = list(local.geoms)
-                elif local.geom_type == "Polygon":
-                    parts = [local]
-                else:
-                    parts = []
+                parts = _polygon_parts(local)
                 if not parts:
                     dropped += 1
                 for part in parts:
@@ -111,7 +123,6 @@ def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndar
         logger.warning("build_map_label: %d 个地图几何体无法栅格化（非 Polygon/"
                        "MultiPolygon、空 exterior 或退化坐标），已跳过", dropped)
     return canvas
-
 
 def gaussian_radius(det_size_px: Tuple[float, float], min_overlap: float = 0.5) -> float:
     """CornerNet 高斯半径（精确解三次方程，保证 IoU ≥ min_overlap）。"""
