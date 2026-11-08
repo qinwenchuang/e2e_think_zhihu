@@ -8,6 +8,7 @@
   vehicle/vru）+ 中心偏移 / log 尺寸 / (sin,cos) yaw 回归目标（100×100 @ 0.5m/px）。
 """
 from __future__ import annotations
+import logging
 import math
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import cv2
 import numpy as np
 from nuplan.common.maps.abstract_map import SemanticMapLayer
 from ..md_common import Config
+
+logger = logging.getLogger(__name__)
 
 # (label, 地图图层)——按绘制顺序排列，后者覆盖前者：
 # roadblock 垫底（大路面），lane/路口覆盖之，人行设施优先级最高。
@@ -54,18 +57,39 @@ def _geometry_local(geometry, origin_xyyaw: np.ndarray):
     return affinity.affine_transform(translated, [a, b, d, e, 0, 0])
 
 
+def _polygon_parts(geometry) -> list:
+    """shapely Polygon/MultiPolygon → 可栅格化的 Polygon 列表；其余返回空。"""
+    if geometry.geom_type == "MultiPolygon":
+        return list(geometry.geoms)
+    if geometry.geom_type == "Polygon":
+        return [geometry]
+    return []
+
+
 def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndarray:
-    """生成地图语义分割标签 (Hm, Wm) uint8。地图查询失败时该层留空，绝不抛异常。"""
+    """生成地图语义分割标签 (Hm, Wm) uint8。地图查询失败时留空，绝不抛异常。
+
+    三层地图只查一次：``get_proximal_map_objects`` 的 layers 参数可一次取回
+    全部图层，旧实现每层各查一次（3 次空间索引 + 3 次反序列化）。
+    """
     from nuplan.common.actor_state.state_representation import Point2D
     hm, wm = cfg.bev_map_size
     canvas = np.zeros((hm, wm), dtype=np.uint8)
+    dropped = 0
+    all_layers = []
+    for _, layers in MAP_LAYER_SPEC:
+        for layer in layers:
+            if layer not in all_layers:
+                all_layers.append(layer)
+    try:
+        objs = map_api.get_proximal_map_objects(
+            point=Point2D(float(ego_pose_xyyaw[0]), float(ego_pose_xyyaw[1])),
+            radius=cfg.map_query_radius, layers=all_layers)
+    except Exception:  # noqa: BLE001  地图不可用 → 全空标签
+        logger.warning("build_map_label: 地图查询失败，返回空标签", exc_info=True)
+        return canvas
+    objs = objs or {}
     for label, layers in MAP_LAYER_SPEC:
-        try:
-            objs = map_api.get_proximal_map_objects(
-                point=Point2D(float(ego_pose_xyyaw[0]), float(ego_pose_xyyaw[1])),
-                radius=cfg.map_query_radius, layers=list(layers))
-        except Exception:  # noqa: BLE001  地图不可用 → 该层留空
-            continue
         layer_mask = np.zeros((hm, wm), dtype=np.uint8)
         for layer in layers:
             for obj in objs.get(layer, []):
@@ -74,16 +98,31 @@ def build_map_label(map_api, ego_pose_xyyaw: np.ndarray, cfg: Config) -> np.ndar
                     continue
                 local = _geometry_local(polygon, ego_pose_xyyaw)
                 if local.is_empty:
+                    dropped += 1
                     continue
-                try:
-                    pts = _to_px(np.asarray(local.exterior.coords, dtype=np.float64), cfg,
-                                 cfg.bev_map_stride)
-                except Exception:  # noqa: BLE001  退化多边形
-                    continue
-                cv2.fillPoly(layer_mask, [pts], 255)
+                parts = _polygon_parts(local)
+                if not parts:
+                    dropped += 1
+                for part in parts:
+                    if part.is_empty or part.exterior is None:
+                        dropped += 1
+                        continue
+                    try:
+                        pts = _to_px(np.asarray(part.exterior.coords, dtype=np.float64),
+                                     cfg, cfg.bev_map_stride)
+                    except Exception:  # noqa: BLE001  退化多边形
+                        dropped += 1
+                        continue
+                    try:
+                        cv2.fillPoly(layer_mask, [pts], 255)
+                    except cv2.error:  # 少于 3 个有效点等退化情形
+                        dropped += 1
+                        continue
         canvas[layer_mask > 0] = label
+    if dropped:
+        logger.warning("build_map_label: %d 个地图几何体无法栅格化（非 Polygon/"
+                       "MultiPolygon、空 exterior 或退化坐标），已跳过", dropped)
     return canvas
-
 
 def gaussian_radius(det_size_px: Tuple[float, float], min_overlap: float = 0.5) -> float:
     """CornerNet 高斯半径（精确解三次方程，保证 IoU ≥ min_overlap）。"""

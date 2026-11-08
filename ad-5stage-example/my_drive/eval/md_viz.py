@@ -229,6 +229,7 @@ def render_fixed_frames(model, entries_ds, indices: List[int], cfg: Config, devi
                         flags: Dict[str, bool]) -> List[np.ndarray]:
     """对固定帧跑前向并渲染（训练循环每个 epoch 调用，写 TB 图像）。"""
     from pathlib import Path
+    was_training = model.training
     model.eval()
     figs = []
     for idx in indices:
@@ -238,12 +239,13 @@ def render_fixed_frames(model, entries_ds, indices: List[int], cfg: Config, devi
         with torch.autocast("cuda", dtype=torch.bfloat16,
                             enabled=cfg.amp and device.type == "cuda"):
             pred = model(batch, with_planner=flags["with_planner"],
-                         with_bev=flags["with_bev"], dino_no_grad=True)
+                         with_bev=flags["with_bev"], dino_no_grad=True,
+                         with_occ=flags.get("with_occ", False))
         pred = {k: (v[0].float() if torch.is_tensor(v) else v) for k, v in pred.items()}
         with np.load(Path(entries_ds.cache_root) / "labels" / f"{sample['token']}.npz") as z:
             boxes, box_cls = z["boxes"], z["box_cls"]
         figs.append(render_sample_figure(
             {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in sample.items()},
             pred, cfg, boxes, box_cls))
-    model.train()
+    model.train(was_training)
     return figs

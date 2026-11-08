@@ -3,3 +3,7 @@ my_drive/__pycache__
 my_drive/data/__pycache__/
 my_drive/eval/__pycache__/
 my_drive/train/__pycache__/
+viz
+viz/.deps/
+viz/output/
+viz/__pycache__/

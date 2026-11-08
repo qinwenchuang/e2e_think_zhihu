@@ -25,6 +25,11 @@ from ..md_common import (
     absolute_to_relative_se2, cam_extrinsic_ego2cam, quaternion_yaw,
 )
 from .md_bev import DET_NAME_TO_CLASS, MapLabelCache, build_det_targets, build_map_label
+from .md_occupancy import load_sample_rays, sample_occupancy_queries
+
+# ImageNet 归一化（DINOv3 预训练口径）：只读常量，避免每张图重复建数组
+_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
 def list_logs() -> List[str]:
@@ -357,15 +362,11 @@ def prepare_pretext_dataset(cfg: Config, num_windows: int, cache_root: Path,
                 ego3, np.stack([frame_global_pose(frames[k]) for k in range(j - 3, j + 5)]))
             dt8 = np.array([(frames[k]["timestamp"] - frames[j]["timestamp"]) / 1e6
                             for k in range(j - 3, j + 5)], dtype=np.float32)
-            dyn = np.asarray(frames[j]["ego_dynamic_state"], dtype=np.float32)
-            cmd = np.asarray(frames[j]["driving_command"], dtype=np.float32)
-            ego8 = np.concatenate([dyn, cmd]).astype(np.float32)[:8]
             tags = [_image_path(log_name, frames[k], CAM_HISTORY).name
                     for k in range(j - 3, j + 5)]
             index.append({"log_name": log_name, "anchor": int(j), "tags8": tags,
                           "dt8": [float(v) for v in dt8],
                           "poses8": [[float(x) for x in p] for p in poses8],
-                          "ego8": [float(v) for v in ego8],
                           "split": split})
             if split == "train":
                 n_train += 1
@@ -391,7 +392,7 @@ def prepare_pretext_dataset(cfg: Config, num_windows: int, cache_root: Path,
 class PretextDataset:
     """8 帧前视窗口（stage 0 未来特征预测用，多步长版）。
 
-    返回 imgs (8,3,H,W)、dt8 (8,)、motion8 (8,3)（均相对当前帧 f3）、ego8 (8,)。
+    返回 imgs (8,3,H,W)、dt8 (8,)、motion8 (8,3)（均相对当前帧 f3）。
     历史 = f0..f3；目标 = f[3+k]，k∈[1, cfg.foresight_max_step] 由训练循环采样。
     """
 
@@ -400,7 +401,9 @@ class PretextDataset:
         self.cache_root = Path(cache_root)
         self.cfg = cfg
         self.augment = augment
-        self._rng = np.random.RandomState(os.getpid() & 0xFFFF)
+        # 训练增强用 PID 区分 worker；val/test 用固定 seed，保证每轮指标可比。
+        self._rng = np.random.RandomState(
+            (os.getpid() & 0xFFFF) if augment else (cfg.seed + 1))
         with open(self.cache_root / "index.json") as f:
             index = json.load(f)
         self.entries = [e for e in index if e["split"] == split]
@@ -417,9 +420,7 @@ class PretextDataset:
             arr = _color_jitter(arr, self._rng)
             arr = _grid_mask(arr, self._rng)
         # ImageNet 归一化（DINOv3 预训练口径）
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        return ((arr - mean) / std).transpose(2, 0, 1)
+        return ((arr - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)
 
     def __getitem__(self, idx: int) -> Dict[str, "torch.Tensor"]:
         import torch
@@ -429,7 +430,6 @@ class PretextDataset:
             "imgs": torch.from_numpy(imgs),                              # f0..f3 输入 + f4..f7 候选目标
             "dt8": torch.tensor(e["dt8"], dtype=torch.float32),          # (8,)
             "motion8": torch.tensor(e["poses8"], dtype=torch.float32),   # (8,3) 相对当前帧 Δpose
-            "ego8": torch.tensor(e["ego8"], dtype=torch.float32),        # (8,)
         }
 
 
@@ -445,12 +445,17 @@ class OverfitDataset:
         self.cache_root = Path(cache_root)
         self.cfg = cfg
         self.augment = augment
-        self._rng = np.random.RandomState(os.getpid() & 0xFFFF)
+        # 训练增强用 PID 区分 worker；val/test 用固定 seed，保证每轮指标可比。
+        self._rng = np.random.RandomState(
+            (os.getpid() & 0xFFFF) if augment else (cfg.seed + 1))
         with open(self.cache_root / "index.json") as f:
             index = json.load(f)
         if split is not None:
             index = [e for e in index if e.get("split", "train") == split]
-        self.entries = [e for e in index if tokens is None or e["token"] in set(tokens)]
+        # tokens 只构一次 set；旧写法在每个 entry 上重建，O(N×M)
+        token_set = set(tokens) if tokens is not None else None
+        self.entries = [e for e in index
+                        if token_set is None or e["token"] in token_set]
         if not self.entries:
             raise RuntimeError(f"数据为空：{cache_root} split={split}")
 
@@ -466,9 +471,7 @@ class OverfitDataset:
             arr = _color_jitter(arr, self._rng)
             arr = _grid_mask(arr, self._rng)
         # ImageNet 归一化（DINOv3 预训练口径）
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        return ((arr - mean) / std).transpose(2, 0, 1)                    # (3,H,W)
+        return ((arr - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)  # (3,H,W)
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
         """返回 MyDriveModel.forward 所需的全部 batch 键（见其输入约定）。"""
@@ -484,7 +487,10 @@ class OverfitDataset:
                         else np.array([-1.5, -1.0, -0.5, 0.0], dtype=np.float32))
             cam_K = z["cam_K"].astype(np.float32).copy()
             cam_e2c = z["cam_ego2cam"].astype(np.float32)
-            orig_w, orig_h = z["img_size_orig"].astype(np.float32)
+            # 每路相机的原图尺寸 (4,2)；旧缓存只存一张 (2,)，广播到 4 路
+            orig_sizes = z["img_size_orig"].astype(np.float32)
+            if orig_sizes.ndim == 1:
+                orig_sizes = np.broadcast_to(orig_sizes.reshape(1, 2), (4, 2)).copy()
             boxes = z["boxes"].astype(np.float32)
             box_cls = z["box_cls"].astype(np.int64)
             bev_map = z["bev_map"].astype(np.int64)
@@ -495,13 +501,22 @@ class OverfitDataset:
             else:
                 future_boxes = np.zeros((8, 1, 7), dtype=np.float32)
                 future_valid = np.zeros((8, 1), dtype=np.uint8)
+        # 当前帧连续占据监督：无 rays/<token>.npz 时返回固定形状的无效占位，
+        # 保证 DataLoader 可混合有/无激光雷达的样本。
+        rays = load_sample_rays(self.cache_root, token)
+        if rays is None:
+            occ_q = np.zeros((self.cfg.occ_num_queries, 3), dtype=np.float32)
+            occ_l = np.zeros((self.cfg.occ_num_queries,), dtype=np.float32)
+            occ_v = np.zeros((self.cfg.occ_num_queries,), dtype=bool)
+        else:
+            occ_q, occ_l, occ_v = sample_occupancy_queries(*rays, self.cfg, self._rng)
         # 图像：历史 3×前视（t3 最旧在前）+ 当前 4 路
         img_hist = np.stack([self._load_image(token, f"t{k}") for k in (3, 2, 1)])  # (3,3,H,W)
         img_cur = np.stack([self._load_image(token, c) for c in CAMS_CURRENT])      # (4,3,H,W)
-        # 内参按 resize 缩放（标签 npz 存的是原图口径内参）
+        # 内参按各相机 resize 缩放（标签 npz 存的是原图口径内参）
         w, h = self.cfg.image_size
-        sx, sy = w / orig_w, h / orig_h
-        for K in cam_K:
+        for K, (orig_w, orig_h) in zip(cam_K, orig_sizes):
+            sx, sy = w / orig_w, h / orig_h
             K[0, 0] *= sx
             K[0, 2] *= sx
             K[1, 1] *= sy
@@ -523,5 +538,8 @@ class OverfitDataset:
             "det_heatmap": torch.from_numpy(det["heatmap"]),            # (2,100,100)
             "det_reg": torch.from_numpy(det["reg"]),                    # (6,100,100)
             "det_reg_mask": torch.from_numpy(det["reg_mask"]),          # (100,100)
+            "occ_queries": torch.from_numpy(occ_q),                     # (Q,3) ego 系
+            "occ_labels": torch.from_numpy(occ_l),                      # (Q,)
+            "occ_valid": torch.from_numpy(occ_v),                       # (Q,) bool
             "token": token,
         }

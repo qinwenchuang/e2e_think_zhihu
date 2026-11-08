@@ -21,14 +21,14 @@ import copy
 import math
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from ..md_common import WORK_ROOT, Config
+from ..md_common import WORK_ROOT, Config, normalize_angle
 from ..data.md_data import OverfitDataset
 from .md_model import MyDriveModel
 
@@ -44,7 +44,7 @@ def _footprint_corners(x, y, yaw, l, w) -> np.ndarray:
 
 
 def _poly_to_grid(corners: np.ndarray, cfg: Config) -> np.ndarray:
-    """(N,2) ego 坐标多边形 → (100,100)@0.5m 的 0/1 栅格掩码（行=x、列=y）。"""
+    """(N,2) ego 坐标多边形 → cfg.bev_map_size 的 0/1 栅格掩码（行=x、列=y）。"""
     ps = cfg.bev_pixel_size / cfg.bev_map_stride
     col = (corners[:, 1] - cfg.pc_y_min) / ps
     row = (corners[:, 0] - cfg.pc_x_min) / ps
@@ -55,7 +55,7 @@ def _poly_to_grid(corners: np.ndarray, cfg: Config) -> np.ndarray:
 
 
 def _boxes_occupancy(boxes: np.ndarray, valid: np.ndarray, cfg: Config) -> np.ndarray:
-    """(M,7)+(M,) → (100,100) 障碍物占用图。"""
+    """(M,7)+(M,) → cfg.bev_map_size 障碍物占用图。"""
     occ = np.zeros(cfg.bev_map_size, dtype=np.uint8)
     for box, v in zip(boxes, valid):
         if not v:
@@ -66,22 +66,30 @@ def _boxes_occupancy(boxes: np.ndarray, valid: np.ndarray, cfg: Config) -> np.nd
     return occ
 
 
+def _step_occupancies(future_boxes: np.ndarray, future_valid: np.ndarray,
+                      cfg: Config) -> List[np.ndarray]:
+    """单样本 (8,M,7)/(8,M) → 8 张障碍物占用图；供 reward/decompose 复用。"""
+    return [_boxes_occupancy(future_boxes[s], future_valid[s], cfg)
+            for s in range(future_boxes.shape[0])]
+
+
 def compute_rewards(sampled: np.ndarray, future_boxes: np.ndarray,
                     future_valid: np.ndarray, bev_map: np.ndarray,
                     traj_gt: np.ndarray, cfg: Config,
-                    ego_len: float, ego_wid: float, margin: float) -> np.ndarray:
+                    ego_len: float, ego_wid: float, margin: float,
+                    occs: Optional[List[List[np.ndarray]]] = None) -> np.ndarray:
     """逐条采样轨迹的规则奖励（numpy，全部在 ego 系）。
 
     :param sampled: (B,k,8,3) 采样轨迹；future_boxes (B,8,M,7) 各时间步障碍物真值；
-        bev_map (B,100,100) 地图标签；traj_gt (B,8,3)
+        bev_map (B,H,W) 地图标签（cfg.bev_map_size）；traj_gt (B,8,3)
     :return: (B,k) 奖励矩阵
     """
     B, k = sampled.shape[:2]
     rewards = np.zeros((B, k), dtype=np.float32)
     for b in range(B):
-        # 每时间步的障碍物占用图（k 条轨迹共享）
-        occs = [_boxes_occupancy(future_boxes[b, s], future_valid[b, s], cfg)
-                for s in range(8)]
+        # 每时间步的障碍物占用图（k 条轨迹共享）；evaluate 可传入已算好的
+        step_occs = occs[b] if occs is not None else _step_occupancies(
+            future_boxes[b], future_valid[b], cfg)
         for i in range(k):
             traj = sampled[b, i]                             # (8,3)
             # ---- 碰撞：自车 footprint（+margin）逐时间步 vs 该时刻障碍物 ----
@@ -93,14 +101,15 @@ def compute_rewards(sampled: np.ndarray, future_boxes: np.ndarray,
                 ego_mask = _poly_to_grid(
                     _footprint_corners(x, y, yaw, ego_len + 2 * margin,
                                        ego_wid + 2 * margin), cfg)
-                if (ego_mask & occs[s]).any():
+                if (ego_mask & step_occs[s]).any():
                     n_col += 1
             r_col = 1.0 if n_col == 0 else 0.0
             # ---- 车道合规：8 步轨迹点落在可行驶区内的比例 ----
             ps = cfg.bev_pixel_size / cfg.bev_map_stride
             rows = ((traj[:, 0] - cfg.pc_x_min) / ps).astype(np.int64)
             cols = ((traj[:, 1] - cfg.pc_y_min) / ps).astype(np.int64)
-            in_grid = (rows >= 0) & (rows < 100) & (cols >= 0) & (cols < 100)
+            hm, wm = cfg.bev_map_size
+            in_grid = (rows >= 0) & (rows < hm) & (cols >= 0) & (cols < wm)
             drivable = np.zeros(8, dtype=bool)
             for s in range(8):
                 if in_grid[s]:
@@ -108,8 +117,10 @@ def compute_rewards(sampled: np.ndarray, future_boxes: np.ndarray,
             r_lane = drivable.mean()
             # ---- 进度：末端前向位移（限幅 20m；倒退得 0） ----
             r_prog = float(np.clip(traj[-1, 0] / 20.0, 0.0, 1.0))
-            # ---- 舒适：yaw 二阶差（jerk 代理） ----
-            ddy = np.abs(np.diff(traj[:, 2], n=2))
+            # ---- 舒适：yaw 二阶差（jerk 代理）；先逐差归一化到 [-π,π)，
+            # 避免跨 ±π 的掉头/近零切线产生 ~2π 伪 jerk ----
+            dth = normalize_angle(np.diff(traj[:, 2]))
+            ddy = np.abs(normalize_angle(np.diff(dth)))
             r_comf = float(np.exp(-ddy.mean()))              # ∈ (0,1]
             # ---- GT 锚定（小权重防 reward hacking） ----
             ade = float(np.linalg.norm(traj[:, :2] - traj_gt[b, :, :2], axis=-1).mean())
@@ -133,15 +144,20 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
                               persistent_workers=cfg.num_workers > 0, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=0, pin_memory=True)
+    from .md_train import check_ckpt_compat
     model = MyDriveModel(cfg).to(device)
     ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
     # 形状匹配的键才载入（同 md_train 的初始化策略）
     own = model.state_dict()
     compatible = {kk: vv for kk, vv in ckpt["model"].items()
                   if kk in own and own[kk].shape == vv.shape}
+    skipped = [kk for kk in ckpt["model"] if kk not in compatible]
+    missing = [kk for kk in own if kk not in compatible]
+    check_ckpt_compat(ckpt, cfg, skipped, source=str(init_from),
+                      missing=missing, own_keys=list(own))
     model.load_state_dict(compatible, strict=False)
     print(f"载入 SFT {init_from}（stage {ckpt.get('stage')} epoch {ckpt.get('epoch')}）"
-          f" 匹配 {len(compatible)} 键")
+          f" 匹配 {len(compatible)} 键，跳过 {len(skipped)} 个不匹配键")
     # 只训 scorer（pos_embed / scorer / quality_head），其余全部冻结
     scorer_prefixes = ("planner.pos_embed.", "planner.scorer.", "planner.quality_head.")
     for n, p in model.named_parameters():
@@ -150,12 +166,16 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
     ref_planner = copy.deepcopy(model.planner)
     for p in ref_planner.parameters():
         p.requires_grad = False
-    model.eval()
+    # 与 stage1 SFT 一致：训练时保持 train 模式（scorer/quality_head 的 dropout
+    # 参与更新）；验证函数内部临时切 eval，结束后恢复。
+    model.train()
     ref_planner.eval()
     params = [p for p in model.parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in params) / 1e6
     optimizer = torch.optim.AdamW(params, lr=cfg.grpo_lr, weight_decay=0.01)
-    steps_per_epoch = math.ceil(len(train_loader) / cfg.grad_accum)
+    grad_accum = max(1, cfg.grad_accum)
+    n_batches = min(limit_batches, len(train_loader)) if limit_batches else len(train_loader)
+    steps_per_epoch = math.ceil(n_batches / grad_accum)
     from .md_train import WarmupCosine
     scheduler = WarmupCosine(optimizer, steps_per_epoch * epochs,
                              max(1, int(steps_per_epoch * epochs * 0.1)), cfg.grpo_lr)
@@ -163,28 +183,40 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
           f"k={cfg.grpo_samples} β={cfg.grpo_beta} | {steps_per_epoch} opt-steps/epoch",
           flush=True)
     def _forward(batch):
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.amp):
-            pred = model(batch, with_planner=True, with_bev=False)
+        # KL 两侧必须同模式：train 模式下 planner/scorer 的 Dropout 会让同槽位
+        # 指向不同轨迹，KL 变成噪声。这里前向临时 eval，反向仍更新 scorer。
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.amp):
+                pred = model(batch, with_planner=True, with_bev=False)
+        finally:
+            model.train(was_training)
         scores = pred["proposal_scores"].float()
         props = pred["proposal_list"][-1].float()
         return scores, props
     def _ref_forward(batch):
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
-                                             enabled=cfg.amp):
-            scene_cur, _ = model._encode(batch["img_cur"], cams=[0, 1, 2, 3],
-                                         need_patch=False)
-            scene_hist, _ = model._encode(batch["img_hist"], cams=[0, 0, 0],
-                                          need_patch=False)
-            r_all = scene_cur.reshape(scene_cur.shape[0], -1, scene_cur.shape[-1])
-            queue = scene_hist.reshape(scene_hist.shape[0], -1, scene_hist.shape[-1])
-            ref = ref_planner(r_all, queue, batch["ego_status"],
-                              batch["ego_motion"], batch["frame_dt"])
-        return ref["proposal_scores"].float()
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16,
+                                                 enabled=cfg.amp):
+                scene_cur, _ = model._encode(batch["img_cur"], cams=[0, 1, 2, 3],
+                                             need_patch=False)
+                scene_hist, _ = model._encode(batch["img_hist"], cams=[0, 0, 0],
+                                              need_patch=False)
+                r_all = scene_cur.reshape(scene_cur.shape[0], -1, scene_cur.shape[-1])
+                queue = scene_hist.reshape(scene_hist.shape[0], -1, scene_hist.shape[-1])
+                ref = ref_planner(r_all, queue, batch["ego_status"],
+                                  batch["ego_motion"], batch["frame_dt"])
+            return ref["proposal_scores"].float()
+        finally:
+            model.train(was_training)
     best_val_reward = -float("inf")
     for epoch in range(epochs):
         t0 = time.time()
         loss_sum, rew_sum, count = 0.0, 0.0, 0
-        n_batches = min(limit_batches, len(train_loader)) if limit_batches else len(train_loader)
+        micro = 0
         for i, batch in enumerate(train_loader):
             if limit_batches and i >= limit_batches:
                 break
@@ -196,7 +228,12 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
             pi = torch.softmax(scores / tau, dim=-1)               # 当前策略 (B,64)
             pi_ref = torch.softmax(scores_ref / tau, dim=-1)       # 冻结参考策略
             idx = torch.multinomial(pi, cfg.grpo_samples, replacement=False)  # 组采样 k 条
-            logp = torch.log(pi + 1e-8).gather(1, idx)            # (B,k)
+            # 无放回采样的联合概率不是 i.i.d. 的 sum(log pi)：
+            # P(有序子集) = Π p_i / Π_{j}(1 - Σ_{l<j} p_l)，补上条件归一化项。
+            sel = pi.gather(1, idx)
+            logp = torch.log(sel + 1e-8)
+            prev = torch.cumsum(sel, dim=1) - sel
+            logp = logp - torch.log((1.0 - prev).clamp_min(1e-6))
             sampled = props.gather(1, idx[:, :, None, None]
                                    .expand(-1, -1, 8, 3))         # (B,k,8,3)
             r = compute_rewards(sampled.detach().cpu().numpy(),
@@ -211,10 +248,18 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
             kl = (pi * (torch.log(pi + 1e-8) - torch.log(pi_ref + 1e-8))).sum(-1).mean()
             loss = -(adv * logp).mean() + cfg.grpo_beta * kl
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            micro += 1
+            # 梯度累积：与 md_train 一致，loss 不预除；更新时按本组实际微批数归一化
+            if (i + 1) % grad_accum == 0 or (i + 1) == n_batches:
+                if micro > 1:
+                    for p in params:
+                        if p.grad is not None:
+                            p.grad.div_(micro)
+                micro = 0
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
             loss_sum += float(loss.detach()) * batch["traj"].shape[0]
             rew_sum += float(r_t.mean()) * batch["traj"].shape[0]
             count += batch["traj"].shape[0]
@@ -246,7 +291,13 @@ def train_grpo(cfg: Config, init_from: Path, cache_root: Path, out_dir: Path,
     return out_dir / "best.pt"
 @torch.no_grad()
 def evaluate_selection(model, ref_planner, val_loader, cfg, device) -> Dict[str, float]:
-    """验证：π（GRPO）与 π_ref（SFT）各自 argmax 选择的轨迹的规则奖励指标对比。"""
+    """验证：π（GRPO）与 π_ref（SFT）各自 argmax 选择的轨迹的规则奖励指标对比。
+
+    训练循环里 model 保持 train 模式（与 stage1 SFT 一致，含 scorer dropout）；
+    这里临时切 eval 保证指标可复现，结束后恢复原模式。
+    """
+    was_training = model.training
+    model.eval()
     sums = {"mean_reward": 0.0, "sft_reward": 0.0, "col_rate": 0.0, "sft_col_rate": 0.0,
             "lane_rate": 0.0, "sft_lane_rate": 0.0, "prog": 0.0, "sft_prog": 0.0,
             "ade": 0.0, "sft_ade": 0.0}
@@ -274,12 +325,18 @@ def evaluate_selection(model, ref_planner, val_loader, cfg, device) -> Dict[str,
             fv = batch["future_valid"][b].cpu().numpy()[None]
             bm = batch["bev_map"][b].cpu().numpy()[None]
             gt = batch["traj"][b].cpu().numpy()[None]
+            # 每帧 8 张障碍物占用图只算一次：π/SFT 两条轨迹 × compute/decompose 共用
+            step_occs = _step_occupancies(fb[0], fv[0], cfg)
             r_pi = compute_rewards(traj_pi, fb, fv, bm, gt, cfg,
-                                   cfg.ego_len, cfg.ego_wid, cfg.col_margin)[0, 0]
+                                   cfg.ego_len, cfg.ego_wid, cfg.col_margin,
+                                   occs=[step_occs])[0, 0]
             r_sft = compute_rewards(traj_sft, fb, fv, bm, gt, cfg,
-                                    cfg.ego_len, cfg.ego_wid, cfg.col_margin)[0, 0]
-            d_pi = _decompose(traj_pi, fb, fv, bm, gt, cfg, cfg.ego_len, cfg.ego_wid, cfg.col_margin)
-            d_sft = _decompose(traj_sft, fb, fv, bm, gt, cfg, cfg.ego_len, cfg.ego_wid, cfg.col_margin)
+                                    cfg.ego_len, cfg.ego_wid, cfg.col_margin,
+                                    occs=[step_occs])[0, 0]
+            d_pi = _decompose(traj_pi, fb, fv, bm, gt, cfg, cfg.ego_len,
+                              cfg.ego_wid, cfg.col_margin, occs=step_occs)
+            d_sft = _decompose(traj_sft, fb, fv, bm, gt, cfg, cfg.ego_len,
+                               cfg.ego_wid, cfg.col_margin, occs=step_occs)
             sums["mean_reward"] += r_pi
             sums["sft_reward"] += r_sft
             sums["col_rate"] += d_pi["col"]
@@ -291,22 +348,25 @@ def evaluate_selection(model, ref_planner, val_loader, cfg, device) -> Dict[str,
             sums["ade"] += d_pi["ade"]
             sums["sft_ade"] += d_sft["ade"]
             n += 1
+    model.train(was_training)
     return {k: v / n for k, v in sums.items()}
-def _decompose(traj, fb, fv, bm, gt, cfg, ego_len, ego_wid, margin) -> Dict[str, float]:
+def _decompose(traj, fb, fv, bm, gt, cfg, ego_len, ego_wid, margin,
+               occs: Optional[List[np.ndarray]] = None) -> Dict[str, float]:
     """单条轨迹的奖励拆项（碰撞率/车道率/进度/ADE，用于验证指标）。"""
     tr = traj[0, 0]
+    step_occs = occs if occs is not None else _step_occupancies(fb[0], fv[0], cfg)
     n_col = 0
     for s in range(8):
-        occ = _boxes_occupancy(fb[0, s], fv[0, s], cfg)
         ego_mask = _poly_to_grid(
             _footprint_corners(float(tr[s, 0]), float(tr[s, 1]), float(tr[s, 2]),
                                ego_len + 2 * margin, ego_wid + 2 * margin), cfg)
-        if (ego_mask & occ).any():
+        if (ego_mask & step_occs[s]).any():
             n_col += 1
     ps = cfg.bev_pixel_size / cfg.bev_map_stride
     rows = ((tr[:, 0] - cfg.pc_x_min) / ps).astype(np.int64)
     cols = ((tr[:, 1] - cfg.pc_y_min) / ps).astype(np.int64)
-    ok = (rows >= 0) & (rows < 100) & (cols >= 0) & (cols < 100)
+    hm, wm = cfg.bev_map_size
+    ok = (rows >= 0) & (rows < hm) & (cols >= 0) & (cols < wm)
     lane = sum(bm[0, rows[s], cols[s]] in DRIVABLE_CLASSES for s in range(8)
                if ok[s]) / 8.0
     prog = float(np.clip(tr[-1, 0] / 20.0, 0.0, 1.0))
@@ -315,17 +375,21 @@ def _decompose(traj, fb, fv, bm, gt, cfg, ego_len, ego_wid, margin) -> Dict[str,
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--init-from", type=str, required=True, help="SFT 检查点（stage1 best_val）")
-    ap.add_argument("--cache-root", type=str, default=str(WORK_ROOT / "cache_13k"))
-    ap.add_argument("--out-dir", type=str, default=str(WORK_ROOT / "runs_v5" / "grpo"))
+    ap.add_argument("--cache-root", type=str, default=str(WORK_ROOT / "cache"))
+    ap.add_argument("--out-dir", type=str, default=str(WORK_ROOT / "runs" / "grpo"))
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--limit-batches", type=int, default=0)
     ap.add_argument("--no-tb", action="store_true")
+    # 表征参数必须与 SFT（stage 1）训练时一致，否则 planner 结构不匹配
+    ap.add_argument("--traj-repr", type=str, default="bezier", choices=["bezier", "raw"])
+    ap.add_argument("--bezier-ctrl", type=int, default=5)
     args = ap.parse_args()
     cfg = Config(batch_size=args.batch_size, grad_accum=args.grad_accum,
-                 num_workers=args.num_workers)
+                 num_workers=args.num_workers, traj_repr=args.traj_repr,
+                 bezier_n_ctrl=args.bezier_ctrl)
     train_grpo(cfg, Path(args.init_from), Path(args.cache_root), Path(args.out_dir),
                epochs=args.epochs, limit_batches=args.limit_batches, tb=not args.no_tb)
 if __name__ == "__main__":
